@@ -53,7 +53,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: unezquake-linux
-          path: build/ezquake*
+          path: build/unezquake-linux-x86_64
           if-no-files-found: warn
 
   build-windows:
