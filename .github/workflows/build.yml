@@ -10,9 +10,6 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
-  # ─────────────────────────────────────────────
-  # Job 1: Build no Linux (Ubuntu)
-  # ─────────────────────────────────────────────
   build-linux:
     name: Linux (Ubuntu)
     runs-on: ubuntu-latest
@@ -49,16 +46,16 @@ jobs:
           cmake .. -DCMAKE_BUILD_TYPE=Release
           make -j$(nproc)
 
+      - name: Listar binários gerados
+        run: find build -maxdepth 2 -type f ! -name "*.o" ! -name "*.a" ! -name "Makefile" | sort
+
       - name: Guardar binário como artefato
         uses: actions/upload-artifact@v4
         with:
           name: unezquake-linux
-          path: build/ezquake-gl.glx
+          path: build/ezquake*
           if-no-files-found: warn
 
-  # ─────────────────────────────────────────────
-  # Job 2: Build no Windows (cross-compile)
-  # ─────────────────────────────────────────────
   build-windows:
     name: Windows (MinGW cross-compile)
     runs-on: ubuntu-latest
@@ -84,6 +81,9 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release || true
           make -j$(nproc) || true
 
+      - name: Listar binários gerados
+        run: find build-win -maxdepth 2 -type f ! -name "*.o" ! -name "*.a" | sort || true
+
       - name: Guardar binário Windows como artefato
         uses: actions/upload-artifact@v4
         with:
@@ -91,9 +91,6 @@ jobs:
           path: build-win/*.exe
           if-no-files-found: warn
 
-  # ─────────────────────────────────────────────
-  # Job 3: Notifica resultado no PR
-  # ─────────────────────────────────────────────
   notify:
     name: Resumo do Build
     runs-on: ubuntu-latest
