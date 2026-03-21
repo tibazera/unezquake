@@ -53,13 +53,13 @@ jobs:
       - name: Renomear binário com a tag
         run: |
           TAG=${{ github.ref_name }}
-          cp build/ezquake-gl.glx unezquake-${TAG}-linux.glx
+          cp build/unezquake-linux-x86_64 unezquake-${TAG}-linux
 
       - name: Upload artefato Linux
         uses: actions/upload-artifact@v4
         with:
           name: linux-binary
-          path: unezquake-*.glx
+          path: unezquake-*-linux
 
   # ─────────────────────────────────────────────
   # Job 2: Publica o Release no GitHub
