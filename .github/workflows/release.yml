@@ -1,0 +1,97 @@
+name: Release unezQuake
+
+on:
+  push:
+    tags:
+      - 'v*'   # dispara em qualquer tag tipo v1.0, v1.2.3, etc
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  # ─────────────────────────────────────────────
+  # Job 1: Build Linux e gera o binário
+  # ─────────────────────────────────────────────
+  build-linux:
+    name: Build Linux
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Instalar dependências
+        run: |
+          sudo add-apt-repository universe -y
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            libsdl2-dev \
+            libjansson-dev \
+            libcurl4-openssl-dev \
+            libpcre3-dev \
+            libexpat1-dev \
+            libpng-dev \
+            libjpeg-dev \
+            libspeex-dev \
+            libspeexdsp-dev \
+            libfreetype6-dev \
+            zlib1g-dev \
+            libminizip-dev \
+            libsndfile1-dev
+
+      - name: Compilar
+        run: |
+          mkdir -p build
+          cd build
+          cmake .. -DCMAKE_BUILD_TYPE=Release
+          make -j$(nproc)
+
+      - name: Renomear binário com a tag
+        run: |
+          TAG=${{ github.ref_name }}
+          cp build/ezquake-gl.glx unezquake-${TAG}-linux.glx
+
+      - name: Upload artefato Linux
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-binary
+          path: unezquake-*.glx
+
+  # ─────────────────────────────────────────────
+  # Job 2: Publica o Release no GitHub
+  # ─────────────────────────────────────────────
+  release:
+    name: Publicar Release
+    runs-on: ubuntu-latest
+    needs: [ build-linux ]
+    permissions:
+      contents: write   # necessário para criar o release
+
+    steps:
+      - name: Baixar artefatos
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Criar Release e publicar binários
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "unezQuake ${{ github.ref_name }}"
+          body: |
+            ## unezQuake ${{ github.ref_name }}
+
+            ### Downloads
+            - **Linux** → `unezquake-${{ github.ref_name }}-linux.glx`
+
+            ### Como usar (Linux)
+            ```bash
+            chmod +x unezquake-*.glx
+            ./unezquake-*.glx
+            ```
+          files: artifacts/**/*
+          draft: false
+          prerelease: false
