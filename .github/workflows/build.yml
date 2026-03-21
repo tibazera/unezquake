@@ -35,6 +35,9 @@ jobs:
             libspeexdsp-dev \
             libfreetype6-dev \
             zlib1g-dev
+            libminizip-dev
+
+
 
       - name: Compilar
         run: |
