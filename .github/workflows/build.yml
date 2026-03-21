@@ -18,6 +18,16 @@ jobs:
       - name: Checkout código
         uses: actions/checkout@v4
 
+      - name: Cache apt packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            /var/cache/apt/archives
+            /var/lib/apt/lists
+          key: apt-${{ runner.os }}-${{ hashFiles('.github/workflows/build.yml') }}
+          restore-keys: |
+            apt-${{ runner.os }}-
+
       - name: Instalar dependências
         run: |
           sudo add-apt-repository universe -y
@@ -38,6 +48,15 @@ jobs:
             zlib1g-dev \
             libminizip-dev \
             libsndfile1-dev
+
+      - name: Cache CMake build
+        uses: actions/cache@v4
+        with:
+          path: build
+          key: cmake-linux-${{ hashFiles('CMakeLists.txt', 'cmake/**') }}-${{ github.sha }}
+          restore-keys: |
+            cmake-linux-${{ hashFiles('CMakeLists.txt', 'cmake/**') }}-
+            cmake-linux-
 
       - name: Compilar
         run: |
