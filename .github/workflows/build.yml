@@ -23,6 +23,7 @@ jobs:
 
       - name: Instalar dependências
         run: |
+          sudo add-apt-repository universe -y
           sudo apt-get update
           sudo apt-get install -y \
             build-essential \
@@ -38,7 +39,7 @@ jobs:
             libspeexdsp-dev \
             libfreetype6-dev \
             zlib1g-dev \
-            libminizip-compat-dev
+            libminizip-dev
 
       - name: Compilar
         run: |
