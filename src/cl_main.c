@@ -18,6 +18,7 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 */
 // cl_main.c  -- client main loop
 
+#include "cl_connectbr.h"
 #include "quakedef.h"
 #include "cdaudio.h"
 #include "cl_slist.h"
@@ -931,28 +932,6 @@ void CL_Connect_f (void)
 	}
 
 	if (server_buf) Q_free(server_buf);
-}
-
-void CL_Connect_BestRoute_f(void)
-{
-	if (Cmd_Argc() != 2) {
-		Com_Printf("Usage: %s <address>\nConnects to given server via fastest available path (ping-wise).\n", Cmd_Argv(0));
-		Com_Printf("Requires Server Browser refreshed with sb_findroutes 1\n");
-		return;
-	}
-	else {
-		netadr_t adr;
-		if (!NET_StringToAdr(Cmd_Argv(1), &adr)) {
-			Com_Printf("Invalid address\n");
-			return;
-		}
-
-		if (adr.port == 0)
-			adr.port = htons(27500);
-
-		SB_PingTree_DumpPath(&adr);
-		SB_PingTree_ConnectBestPath(&adr);
-	}
 }
 
 void CL_TCPConnect_f (void)
@@ -2050,6 +2029,7 @@ static void CL_InitLocal(void)
 	Cmd_AddCommand ("disconnect", CL_Disconnect_f);
 	Cmd_AddCommand ("connect", CL_Connect_f);
 	Cmd_AddCommand ("connectbr", CL_Connect_BestRoute_f);
+	Cmd_AddCommand ("connectnext", CL_Connect_Next_f);
 
 	Cmd_AddCommand ("qwurl", CL_QWURL_f);
 
