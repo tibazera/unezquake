@@ -661,6 +661,7 @@ set(client
         ${SOURCE_DIR}/cl_input.c
         ${SOURCE_DIR}/cl_mouseaccel.c
         ${SOURCE_DIR}/cl_main.c
+        ${SOURCE_DIR}/cl_connectbr.c
         ${SOURCE_DIR}/cl_multiview.c
         ${SOURCE_DIR}/cl_nqdemo.c
         ${SOURCE_DIR}/cl_parse.c
