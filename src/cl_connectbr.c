@@ -1,981 +1,715 @@
 /*
-Copyright (C) 2011 johnnycz
+Copyright (C) 2024 unezQuake team
 
-This program is free software; you can redistribute it and/or
-modify it under the terms of the GNU General Public License
-as published by the Free Software Foundation; either version 2
-of the License, or (at your option) any later version.
+cl_connectbr.c - Smart route selection for connectbr/connectnext commands
 
-This program is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+Enumerates proxy routes from the ping tree and server browser,
+measures real ping and packet loss to each proxy hop, and connects
+via the best one.
 
-See the GNU General Public License for more details.
-
-You should have received a copy of the GNU General Public License
-along with this program.  If not, see <http://www.gnu.org/licenses/>.
+CVars:
+  cl_connectbr_test_packets   - number of UDP probes per route (default 25)
+  cl_connectbr_timeout_ms     - receive timeout in ms (default 600)
+  cl_connectbr_packet_delay   - ms between probes (default 15)
+  cl_connectbr_ping_green     - ping threshold for green colour (default 40 ms)
+  cl_connectbr_ping_yellow    - ping threshold for yellow colour (default 80 ms)
+  cl_connectbr_ping_orange    - ping threshold for orange colour (default 200 ms); above = red (unplayable)
+  cl_connectbr_weight_ping    - score weight for ping (default 0.6)
+  cl_connectbr_weight_loss    - score weight for loss (default 0.4)
+  cl_connectbr_verbose        - verbosity level 0/1/2 (default 1)
+  cl_connectbr_debug          - debug logging 0/1 (default 0)
 */
-/**
-	\file
-
-	\brief
-	Module for finding best connection to a server, ping-wise.
-
-	\author johnnycz
-**/
 
 #include "quakedef.h"
-#include <limits.h>
-#ifndef _WIN32
-#include <sys/time.h>
-#include <sys/types.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <netdb.h>
-#include <sys/param.h>
-#include <sys/ioctl.h>
-#include <sys/uio.h>
-#include <arpa/inet.h>
-#include <errno.h>
-#include <unistd.h>
-#endif
 #include "EX_browser.h"
+#include "cl_connectbr.h"
 
-// declared in EX_browser.c
-extern cvar_t sb_proxinfopersec;
-extern cvar_t sb_proxretries;
-extern cvar_t sb_proxtimeout;
-extern cvar_t sb_listcache;
+// --------------------------------------------
+// CVars
+// --------------------------------------------
+cvar_t cl_connectbr_test_packets  = {"cl_connectbr_test_packets",  "25",   CVAR_ARCHIVE};
+cvar_t cl_connectbr_timeout_ms    = {"cl_connectbr_timeout_ms",    "600",  CVAR_ARCHIVE};
+cvar_t cl_connectbr_packet_delay  = {"cl_connectbr_packet_delay",  "15",   CVAR_ARCHIVE};
+cvar_t cl_connectbr_ping_green    = {"cl_connectbr_ping_green",    "40",   CVAR_ARCHIVE};
+cvar_t cl_connectbr_ping_yellow   = {"cl_connectbr_ping_yellow",   "80",   CVAR_ARCHIVE};
+cvar_t cl_connectbr_ping_orange   = {"cl_connectbr_ping_orange",   "200",  CVAR_ARCHIVE};
+cvar_t cl_connectbr_weight_ping   = {"cl_connectbr_weight_ping",   "0.6",  CVAR_ARCHIVE};
+cvar_t cl_connectbr_weight_loss   = {"cl_connectbr_weight_loss",   "0.4",  CVAR_ARCHIVE};
+cvar_t cl_connectbr_verbose       = {"cl_connectbr_verbose",       "1",    CVAR_ARCHIVE};
+cvar_t cl_connectbr_debug         = {"cl_connectbr_debug",         "0",    CVAR_ARCHIVE};
 
-// non-leaf = proxy (or users computer) = has more than 1 neighbour
-// at the time of writing this code there were 10 active proxies around the world
-#define MAX_NONLEAVES 40
+// --------------------------------------------
+// Constants
+// --------------------------------------------
+#define CONNECTBR_MAX_ROUTES    12
+#define CONNECTBR_MAX_PROXIES   32
+#define MAX_PROXYLIST           256
+#define MAX_ADDRESS_LENGTH      128
 
-#define PROXY_PINGLIST_QUERY "\xff\xff\xff\xffpingstatus"
-#define PROXY_PINGLIST_QUERY_LEN (sizeof(PROXY_PINGLIST_QUERY)-1)
-#define PROXY_REPLY_ENTRY_LEN 8
-#define PROXY_REPLY_BUFFER_SIZE (PROXY_REPLY_ENTRY_LEN*MAX_SERVERS)
+#define BR_Debug(...) \
+	do { if (cl_connectbr_debug.value) Com_Printf("[connectbr] " __VA_ARGS__); } while(0)
 
-// current amount of qw servers ~ 300... but neighbour count means MAX_SERVERS*MAX_NONLEAVES
-#define INVALID_NODE (-1)
-typedef int nodeid_t;
+// --------------------------------------------
+// Types
+// --------------------------------------------
+typedef struct {
+	char    proxylist[MAX_PROXYLIST];
+	char    label[128];
+	float   ping_ms;
+	float   loss_pct;
+	float   score;
+	qbool   via_proxy;
+	qbool   valid;
+} route_t;
 
-// only pings 0-999 are in our interest; and -1 for invalid ping
-#define DIST_INFINITY SHRT_MAX
-typedef short dist_t;
+// --------------------------------------------
+// State
+// --------------------------------------------
+static route_t   br_routes[CONNECTBR_MAX_ROUTES];
+static int       br_route_count   = 0;
+static int       br_current_route = 0;
+static netadr_t  br_target_addr;
+static qbool     br_active        = false;
+static qbool     br_measuring     = false;
 
-// trick around language limits - allows to copy 4 bytes with "="
-typedef struct ipaddr_t {
-	byte data[4];
-} ipaddr_t;
+// --------------------------------------------
+// Known QW proxy fallback list
+// --------------------------------------------
+static const char *br_known_proxies[] = {
+	"177.93.132.220:30000",
+	"103.63.29.40:30000",
+	"arenacamper.ddns.net:30000",
+	"berlin.qwsv.net:30000",
+	NULL
+};
 
-typedef struct ping_node_t {
-	ipaddr_t ipaddr;
-	nodeid_t prev;           // previous node on the shortest path
-	nodeid_t nlist_start;    // index of the first neighbour
-	nodeid_t nlist_end;      // index of the last neighbour + 1
-	dist_t dist;              // distance (= ping)
-	qbool visited;
-	unsigned short proxport; // if there's a proxy on this address,
-	                         // this is the port it's running on
-	                         // and it is already in the network format
-} ping_node_t;
-
-typedef struct ping_neighbour_t {
-	nodeid_t id;
-	dist_t dist;
-} ping_neighbour_t;
-
-typedef struct proxy_query_request_t {
-	socket_t sock;
-	nodeid_t nodeid;
-	qbool done;
-} proxy_query_request_t;
-
-typedef struct proxy_request_queue_t {
-	proxy_query_request_t *data;
-	size_t items;
-	qbool sending_done; // sending thread ended
-	qbool allrecved;	// all proxies have been successfully scanned
-} proxy_request_queue;
-
-static ping_node_t ping_nodes[MAX_SERVERS];
-static nodeid_t ping_nodes_count = 0;
-#define MAX_SERVERS_BLOCKSIZE (MAX_SERVERS*MAX_NONLEAVES)
-static ping_neighbour_t* ping_neighbours;
-static unsigned long ping_neighbours_max;
-static nodeid_t ping_neighbours_count = 0;
-
-static nodeid_t startnode_id = 0;
-
-static qbool building_pingtree = false; // when true, the pingtree build thread is still working
-static qbool pingtree_built = false;
-
-static sem_t phase2thread_lock;
-
-static void SB_PingTree_Assertions(void)
+// --------------------------------------------
+// Colour helpers
+// --------------------------------------------
+static const char *CL_BR_PingColor(float ms)
 {
-	if (ping_nodes_count >= MAX_SERVERS) {
-		Sys_Error("EX_Browser_pathfind: max nodes count reached");
-	}
+	int g = (int)cl_connectbr_ping_green.value;
+	int y = (int)cl_connectbr_ping_yellow.value;
+	int o = (int)cl_connectbr_ping_orange.value;
+	if (g <= 0) g = 40;
+	if (y <= 0) y = 80;
+	if (o <= 0) o = 200;
+	if (ms <= g) return "&c0f0";
+	if (ms <= y) return "&cff0";
+	if (ms <= o) return "&cfa0";
+	return "&cf00";
+}
 
-	if (ping_neighbours_count >= ping_neighbours_max) {
-		while (ping_neighbours_count >= ping_neighbours_max)
-			ping_neighbours_max += MAX_SERVERS_BLOCKSIZE;
-		ping_neighbours = Q_realloc(ping_neighbours, ping_neighbours_max * sizeof(ping_neighbour_t));
-		if (!ping_neighbours) {
-			Sys_Error("EX_Browser_pathfind: max neighbours count reached");
+static const char *CL_BR_LossColor(float pct)
+{
+	if (pct <= 0) return "&c0f0";
+	if (pct <= 5) return "&cff0";
+	return "&cf00";
+}
+
+// --------------------------------------------
+// Browser ping lookup
+// --------------------------------------------
+static int CL_BR_GetBrowserPing(const netadr_t *dest)
+{
+	int i, best = -1;
+	SB_ServerList_Lock();
+	for (i = 0; i < serversn; i++) {
+		if (NET_CompareAdr(servers[i]->address, *dest) && servers[i]->ping >= 0) {
+			best = servers[i]->ping;
+			break;
 		}
 	}
-
-	if (startnode_id != 0) {
-		// a bit paranoid check, startnode is always the first node
-		Sys_Error("EX_browser_pathfind: startnode_id != 0");
-	}
+	SB_ServerList_Unlock();
+	return best;
 }
 
-static int SB_PingTree_FindIp(ipaddr_t ipaddr)
+// --------------------------------------------
+// A2A_PING measurement
+// --------------------------------------------
+static qbool CL_BR_MeasureHop(const netadr_t *dest,
+                               float *out_ping, float *out_loss)
 {
-	int i;
-
-	// xxx make the lookup faster than linear
-	for (i = 0; i < ping_nodes_count; i++) {
-		if (memcmp(&ping_nodes[i].ipaddr, &ipaddr, sizeof(ipaddr_t)) == 0) {
-			return i;
-		}
-	}
-
-	return INVALID_NODE;
-}
-
-static int SB_PingTree_AddNode(ipaddr_t ipaddr, unsigned short proxport)
-{
-	int id = SB_PingTree_FindIp(ipaddr);
-
-	if (id != INVALID_NODE) {
-		if (proxport && !ping_nodes[id].proxport) {
-			ping_nodes[id].proxport = proxport;
-		}
-		return id;
-	}
-
-	id = ping_nodes_count++;
-
-	SB_PingTree_Assertions();
-	ping_nodes[id].ipaddr = ipaddr;
-	ping_nodes[id].prev = INVALID_NODE;
-	ping_nodes[id].nlist_start = INVALID_NODE;
-	ping_nodes[id].nlist_end = INVALID_NODE;
-	ping_nodes[id].dist = DIST_INFINITY;
-	ping_nodes[id].proxport = proxport;
-	ping_nodes[id].visited = false;
-	SB_PingTree_Assertions();
-
-	return id;
-}
-
-static int SB_PingTree_AddNeighbour(nodeid_t neighbour_id, dist_t dist)
-{
-	int id = ping_neighbours_count++;
-
-	SB_PingTree_Assertions();
-	ping_neighbours[id].id = neighbour_id;
-	ping_neighbours[id].dist = dist;
-	SB_PingTree_Assertions();
-
-	return id;
-}
-
-static ipaddr_t SB_DummyIpAddr(void)
-{
-	ipaddr_t dummy = {{0, 0, 0, 0}};
-	return dummy;
-}
-
-static void SB_PingTree_AddSelf(void)
-{
-	startnode_id = SB_PingTree_AddNode(SB_DummyIpAddr(), 0);
-}
-
-static void SB_PingTree_Clear(void)
-{
-	ping_nodes_count = 0;
-	ping_neighbours_count = 0;
-	SB_PingTree_AddSelf();
-}
-
-static ipaddr_t SB_Netaddr2Ipaddr(const netadr_t *netadr)
-{
-	ipaddr_t retval;
-	memcpy(retval.data, &netadr->ip, 4);
-	return retval;
-}
-
-static qbool SB_PingTree_IsServerDead(const server_data *data)
-{
-	return data->ping < 0;
-}
-
-static qbool SB_PingTree_IsProxyFiltered(const server_data *data)
-{
-	if (!data->qwfwd) {
-		return false;
-	}
-	else if (sb_ignore_proxy.string[0] == '\0') {
-		return false;
-	}
-	else {
-		char ip_str[32];
-		const byte *ip = data->address.ip;
-		int port = (int) ntohs(data->address.port);
-		
-		snprintf(&ip_str[0], sizeof(ip_str), "%d.%d.%d.%d:%d", ip[0], ip[1], ip[2], ip[3], port);
-
-		return strstr(sb_ignore_proxy.string, ip_str) != NULL;
-	}
-}
-
-static nodeid_t SB_PingTree_AddServer(const server_data *data)
-{
-	nodeid_t node_id = INVALID_NODE;
-
-	if (!SB_PingTree_IsServerDead(data) && !SB_PingTree_IsProxyFiltered(data)) {
-			node_id = SB_PingTree_AddNode(SB_Netaddr2Ipaddr(&data->address),
-				data->qwfwd ? data->address.port : 0);
-
-		SB_PingTree_AddNeighbour(node_id, data->ping);
-	}
-	
-	return node_id;
-}
-
-static void SB_PingTree_AddProxyPing(netadr_t adr, dist_t dist)
-{
-	nodeid_t id_neighbour;
-	ipaddr_t ip = SB_Netaddr2Ipaddr(&adr);
-
-	id_neighbour = SB_PingTree_FindIp(ip); // most of the servers should be found
-	if (id_neighbour == INVALID_NODE) {
-		// strange - there is no direct route to this server, but a proxy can reach it (!)
-		id_neighbour = SB_PingTree_AddNode(ip, 0);
-	}
-	
-	SB_PingTree_AddNeighbour(id_neighbour, dist);
-}
-
-static void SB_Proxy_ParseReply(const byte *buf, size_t buflen, proxy_ping_report_callback callback)
-{
-	size_t entries = buflen / PROXY_REPLY_ENTRY_LEN;
-	int i;
-
-	Com_DPrintf("Reading %d entries from a proxy reply\n", entries);
-
-	for (i = 0; i < entries; i++) {
-		netadr_t adr;
-		dist_t dist = 0;
-
-		adr.type = NA_IP;
-		memcpy(adr.ip, buf, 4);
-		buf += 4;
-		
-		adr.port = 0;
-		adr.port |= 0x00FF & *buf++;
-		adr.port |= 0xFF00 & (*buf++ << 8);
-
-		dist |= 0x00FF & *buf++;
-		dist |= 0xFF00 & (*buf++ << 8);
-
-		if (dist >= 0) {
-			// "server not reachable" is reported as 65536, in our case -1
-			callback(adr, dist);
-		}
-	}
-}
-
-void SB_Proxy_QueryForPingList(const netadr_t *address, proxy_ping_report_callback callback)
-{
-	byte buf[PROXY_REPLY_BUFFER_SIZE];
-	char packet[] = PROXY_PINGLIST_QUERY;
-	char adrstr[32];
-	struct sockaddr_in addr_to, addr_from;
-	struct timeval timeout;
+	socket_t sock = INVALID_SOCKET;
+	struct sockaddr_storage to_addr;
+	struct timeval tv;
 	fd_set fd;
-	socket_t sock;
 	int i, ret;
-	socklen_t inaddrlen;
+	int test_packets, recv_count = 0;
+	double *send_times = NULL;
+	double *recv_times = NULL;
+	qbool  *received   = NULL;
+	double ping_sum    = 0;
+	char   packet[]    = "\xff\xff\xff\xffk\n";
+	qbool  success     = false;
 
-	snprintf(&adrstr[0], sizeof(adrstr), "%d.%d.%d.%d", (int) address->ip[0], (int) address->ip[1], (int) address->ip[2], (int) address->ip[3]);
+	if (!out_ping || !out_loss) return false;
 
-	addr_to.sin_addr.s_addr = inet_addr((const char *)adrstr);
-	if (addr_to.sin_addr.s_addr == INADDR_NONE) {
-		return;
-	}
-	addr_to.sin_family = AF_INET;
-	addr_to.sin_port = address->port;
+	test_packets = (int)cl_connectbr_test_packets.value;
+	if (test_packets < 5)  test_packets = 5;
+	if (test_packets > 50) test_packets = 50;
+
+	send_times = (double *)Q_malloc(test_packets * sizeof(double));
+	recv_times = (double *)Q_malloc(test_packets * sizeof(double));
+	received   = (qbool  *)Q_malloc(test_packets * sizeof(qbool));
+
+	memset(received,   0, test_packets * sizeof(qbool));
+	memset(send_times, 0, test_packets * sizeof(double));
+	memset(recv_times, 0, test_packets * sizeof(double));
 
 	sock = UDP_OpenSocket(PORT_ANY);
-	for (i = 0; i < sb_proxretries.integer; i++) {
-		ret = sendto(sock, packet, strlen(packet), 0, (struct sockaddr *)&addr_to, sizeof(struct sockaddr));
-		if (ret == -1) // failure, try again
-			continue;
+	if (sock == INVALID_SOCKET) {
+		BR_Debug("failed to open socket\n");
+		goto cleanup;
+	}
 
-_select:
-		FD_ZERO(&fd);
-		FD_SET(sock, &fd);
-		timeout.tv_sec = 0;
-		timeout.tv_usec = sb_proxtimeout.integer * 1000;
-		ret = select(sock+1, &fd, NULL, NULL, &timeout);
-		if (ret <= 0) { // timed out or error
-			Com_DPrintf("select() gave errno = %d : %s\n", errno, strerror(errno));
-			continue;
+	NetadrToSockadr(dest, &to_addr);
+
+	{
+		int pkt_delay = (int)cl_connectbr_packet_delay.value;
+		if (pkt_delay < 5) pkt_delay = 5;
+		for (i = 0; i < test_packets; i++) {
+			send_times[i] = Sys_DoubleTime();
+			sendto(sock, packet, strlen(packet), 0,
+			       (struct sockaddr *)&to_addr, sizeof(struct sockaddr));
+			Sys_MSleep(pkt_delay);
 		}
-
-		inaddrlen = sizeof(struct sockaddr_in);
-		ret = recvfrom(sock, (char *) buf, sizeof(buf), 0, (struct sockaddr *)&addr_from, &inaddrlen);
-
-		if (ret == -1) // failure, try again
-			continue;
-		if (addr_from.sin_addr.s_addr != addr_to.sin_addr.s_addr) // martian, discard and see if a valid response came in after it
-			goto _select;
-		if (strncmp("\xff\xff\xff\xffn", (char *) buf, 5) == 0)
-			SB_Proxy_ParseReply(buf+5, ret-5, callback);
-
-		break;
-	}
-	closesocket(sock);
-}
-
-static void SB_PingTree_AddNodes(void)
-{
-	int i;
-	
-	// add our neighbours - servers we directly ping
-	SB_ServerList_Lock();
-	ping_nodes[startnode_id].nlist_start = ping_neighbours_count;
-	for (i = 0; i < serversn; i++) {
-		SB_PingTree_AddServer(servers[i]);
-	}
-	ping_nodes[startnode_id].nlist_end = ping_neighbours_count;
-	SB_ServerList_Unlock();
-}
-
-static netadr_t SB_NodeNetadr_Get(nodeid_t id)
-{
-	netadr_t ret;
-	ret.type = NA_IP;
-	ret.port = ping_nodes[id].proxport;
-	memcpy(&ret.ip, ping_nodes[id].ipaddr.data, 4);
-	return ret;
-}
-
-int SB_PingTree_SendQueryThread(void *thread_arg)
-{
-	proxy_request_queue *queue = (proxy_request_queue *) thread_arg;
-	int i, ret;
-	double interval_ms;
-#ifdef _WIN32
-	timerresolution_session_t timersession = {0, 0};
-#endif
-
-	// Null check for queue
-	if (!queue) {
-		Com_DPrintf("SB_PingTree_SendQueryThread: queue is NULL\n");
-		return -1;
-	}
-
-	// Null check for queue data
-	if (!queue->data) {
-		Com_DPrintf("SB_PingTree_SendQueryThread: queue->data is NULL\n");
-		return -1;
-	}
-
-	interval_ms = (1.0 / sb_proxinfopersec.value) * 1000.0;
-
-	Sys_TimerResolution_InitSession(&timersession);
-	Sys_TimerResolution_RequestMinimum(&timersession);
-
-	for (i = 0; i < queue->items; i++) {
-		if (!queue->data[i].done) {
-			struct sockaddr_storage addr_to;
-			netadr_t netadr;
-
-			// Validate nodeid
-			if (queue->data[i].nodeid < 0 || queue->data[i].nodeid >= ping_nodes_count) {
-				Com_DPrintf("SB_PingTree_SendQueryThread: invalid nodeid %d\n", queue->data[i].nodeid);
-				continue;
-			}
-
-			netadr = SB_NodeNetadr_Get(queue->data[i].nodeid);
-
-			NetadrToSockadr(&netadr, &addr_to);
-			ret = sendto(queue->data[i].sock,
-				PROXY_PINGLIST_QUERY, PROXY_PINGLIST_QUERY_LEN, 0,
-				(struct sockaddr *) &addr_to, sizeof (struct sockaddr));
-			if (ret < 0) {
-				Com_DPrintf("SB_PingTree_SendQueryThread sendto returned %d\n", ret);
-			}
-			Sys_MSleep(interval_ms);
-		}
-
-		if (queue->allrecved) break;
-	}
-
-	Sys_TimerResolution_Clear(&timersession);
-
-	queue->sending_done = true;
-
-	return 0;
-}
-
-#define PROXY_SERIALIZE_FILE_VERSION 1
-void SB_Proxylist_Serialize_Start(FILE *f)
-{
-	int version = PROXY_SERIALIZE_FILE_VERSION;
-
-	// header
-	// - version
-	fwrite(&version, sizeof(int), 1, f);
-}
-
-void SB_Proxylist_Serialize_Reply(FILE *f, netadr_t proxy, void *buf, size_t buflen)
-{
-	fwrite(&proxy, sizeof(netadr_t), 1, f);
-	fwrite(&buflen, sizeof(size_t), 1, f);
-	fwrite(buf, buflen, 1, f);
-}
-
-void SB_Proxylist_Serialize_End(FILE *f)
-{
-	netadr_t invalid;
-
-	invalid.type = NA_INVALID;
-	fwrite(&invalid, sizeof(netadr_t), 1, f);
-}
-
-static qbool SB_PingTree_RecvQuery(proxy_request_queue *queue, FILE *f)
-{
-	qbool last_cycle = false;
-	fd_set recvset;
-	int maxsock = 0;
-	int i, ret;
-	struct timeval timeout;
-	qbool allrecved = false;
-
-	timeout.tv_sec = 0;
-	timeout.tv_usec = sb_proxtimeout.integer * 1000;
-
-	for (;;) {
-		if (queue->sending_done) {
-			last_cycle = true;
-		}
-		
-		allrecved = true;
-		FD_ZERO(&recvset);
-		for (i = 0; i < queue->items; i++) {
-			if (!queue->data[i].done) {
-				socket_t sock = queue->data[i].sock;
-				FD_SET(sock, &recvset);
-				if ((int) sock > maxsock) {
-					maxsock = (int) sock;
-				}
-				allrecved = false;
-			}
-		}
-		if (allrecved) {
-			queue->allrecved = true;
-			break;
-		}
-
-		ret = select((maxsock + 1), &recvset, NULL, NULL, &timeout);
-
-		if (ret == 0 && last_cycle == true) {
-			break; // ret = 0 means we got timeout
-		}
-
-		if (ret == 0) {
-			continue; // not all proxies were queried yet
-		}
-
-		if (ret < 0) {
-			Com_DPrintf("select returned %d\n", ret);
-			break;
-		}
-
-		for (i = 0; i < queue->items; i++) {
-			if (!queue->data[i].done && FD_ISSET(queue->data[i].sock, &recvset)) {
-				byte buf[PROXY_REPLY_BUFFER_SIZE];
-				struct sockaddr_storage addr_from;
-				socklen_t addr_from_len = sizeof(struct sockaddr_in);
-
-				ret = recvfrom(queue->data[i].sock, (char *) buf, PROXY_REPLY_BUFFER_SIZE, 0, (struct sockaddr *) &addr_from, &addr_from_len);
-				if (ret == -1) {
-					Com_DPrintf("SB_PingTree_RecvQuery recvfrom failed\n");
-					continue;
-				}
-
-				if (strncmp("\xff\xff\xff\xffn", (char *) buf, 5) == 0) {
-					nodeid_t id = queue->data[i].nodeid;
-					queue->data[i].done = true;
-					ping_nodes[id].nlist_start = ping_neighbours_count;
-					if (f && ret > 5)
-							SB_Proxylist_Serialize_Reply(f, SB_NodeNetadr_Get(id), buf+5, ret-5);
-					SB_Proxy_ParseReply(buf+5, ret-5, SB_PingTree_AddProxyPing);
-					ping_nodes[id].nlist_end = ping_neighbours_count;
-				}
-				else {
-					Com_DPrintf("Invalid reply received\n");
-				}
-			}
-		}
-	}
-
-	return allrecved;
-}
-
-static void SB_PingTree_ScanProxies(void)
-{
-	int i;
-	proxy_request_queue *queue = NULL;
-	size_t request = 0;
-	FILE *f = NULL;
-
-	// Allocate queue on heap
-	queue = (proxy_request_queue *) Q_malloc(sizeof(proxy_request_queue));
-	if (!queue) {
-		Com_Printf("Failed to allocate memory for proxy request queue\n");
-		return;
-	}
-
-	// Initialize queue fields
-	queue->data = NULL;
-	queue->items = 0;
-	queue->sending_done = false;
-	queue->allrecved = false;
-
-	for (i = 0; i < ping_nodes_count; i++) {
-		if (ping_nodes[i].proxport) {
-			queue->items++;
-		}
-	}
-
-	if (!queue->items) {
-		Q_free(queue);
-		return;
-	}
-
-	queue->data = (proxy_query_request_t *) Q_malloc(sizeof(proxy_query_request_t) * queue->items);
-	if (!queue->data) {
-		Com_Printf("Failed to allocate memory for proxy request data\n");
-		Q_free(queue);
-		return;
-	}
-
-	for (i = 0; i < ping_nodes_count; i++) {
-		if (ping_nodes[i].proxport) {
-			queue->data[request].done = false;
-			queue->data[request].nodeid = i;
-			queue->data[request].sock = UDP_OpenSocket(PORT_ANY);
-			request++;
-		}
-	}
-
-	if (sb_listcache.value) {
-		char prx_data_path[MAX_OSPATH] = {0};
-
-		snprintf(&prx_data_path[0], sizeof(prx_data_path), "%s/%s", com_homedir, "proxies_data");
-		f = fopen(prx_data_path, "wb");
-		if (f)
-			SB_Proxylist_Serialize_Start(f);
-	}
-
-	for (i = 0; i < sb_proxretries.integer; i++) {
-		queue->sending_done = false;
-		if (Sys_CreateDetachedThread(SB_PingTree_SendQueryThread, (void *) queue) < 0) {
-			Com_Printf("Failed to create SB_PingTree_SendQueryThread thread\n");
-			// If thread creation fails, don't continue with this retry
-			continue;
-		}
-		SB_PingTree_RecvQuery(queue, f);
-		
-		// Wait for the sending thread to complete before next retry
-		while (!queue->sending_done) {
-			Sys_MSleep(10);
-		}
-		
-		if (queue->allrecved) {
-			break;
-		}
-	}
-
-	if (f) {
-		SB_Proxylist_Serialize_End(f);
-		fclose(f);
-	}
-
-	for (i = 0; i < queue->items; i++) {
-		closesocket(queue->data[i].sock);
-	}
-
-	Q_free(queue->data);
-	Q_free(queue);
-}
-
-static nodeid_t SB_PingTree_NearestNodeGet(void)
-{
-	// XXX: implement using binary/fibonacci heap...
-	int i;
-	nodeid_t ret = INVALID_NODE;
-	dist_t minimum = DIST_INFINITY;
-
-	for (i = 0; i < ping_nodes_count; i++) {
-		if (!ping_nodes[i].visited && ping_nodes[i].dist < minimum) {
-			ret = i;
-			minimum = ping_nodes[i].dist;
-		}
-	}
-
-	return ret;
-}
-
-static void SB_PingTree_Dijkstra(void)
-{
-	int i;
-
-	ping_nodes[startnode_id].dist = 0;
-
-	for (;;) {
-		nodeid_t cur = SB_PingTree_NearestNodeGet();
-		if (cur == INVALID_NODE) break;
-
-		ping_nodes[cur].visited = true;
-		for (i = ping_nodes[cur].nlist_start; i < ping_nodes[cur].nlist_end; i++) {
-			dist_t altdist = ping_nodes[cur].dist + ping_neighbours[i].dist;
-			if (altdist < ping_nodes[ping_neighbours[i].id].dist) {
-				// so-called Relax()
-				ping_nodes[ping_neighbours[i].id].dist = altdist;
-				ping_nodes[ping_neighbours[i].id].prev = cur;
-			}
-		}
-	}
-}
-
-static void SB_PingTree_Phase1(void)
-{
-	SB_PingTree_Clear();
-	SB_PingTree_AddNodes();
-}
-
-static void SB_PingTree_UpdateServerList(void)
-{
-	int i;
-
-	SB_ServerList_Lock();
-
-	for (i = 0; i < serversn; i++) {
-		nodeid_t id = SB_PingTree_FindIp(SB_Netaddr2Ipaddr(&servers[i]->address));
-		if (id == INVALID_NODE || ping_nodes[id].prev == INVALID_NODE || ping_nodes[id].prev == startnode_id) continue;
-
-		SB_Server_SetBestPing(servers[i], ping_nodes[id].dist);
-	}
-
-	SB_ServerList_Unlock();
-}
-
-int SB_PingTree_Phase2(void *ignored_arg)
-{
-	SB_PingTree_ScanProxies();
-	SB_PingTree_Dijkstra();
-	SB_PingTree_UpdateServerList();
-
-	sb_queuedtriggers |= SB_TRIGGER_NOTIFY_PINGTREE;
-	Sys_SemPost(&phase2thread_lock);
-	building_pingtree = false;
-	pingtree_built = true;
-	return 0;
-}
-
-/// Has the Ping Tree been fully built (Phase2 complete)?
-/// NOTE: ping_nodes_count > 0 becomes true during Phase1, before Dijkstra
-/// runs -- using it would cause connectbr to read unfinished paths.
-/// pingtree_built is only set after Phase2 completes successfully.
-qbool SB_PingTree_Built(void)
-{
-	return pingtree_built;
-}
-
-/// Creates whole graph structure for looking up shortest paths to servers (ping-wise).
-///
-/// Grabs data from the server browser and then from the proxies.
-void SB_PingTree_Build(void)
-{
-	if (building_pingtree) {
-		Com_Printf("Ping Tree is still being built...\n");
-		return;
-	}
-	// no race condition here, as this must always get executed by the main thread
-	building_pingtree = true;
-	pingtree_built = false;
-	Com_Printf("Building the Ping Tree...\n");
-
-	// first quick phase is initialization + quick read of data from the server browser
-	SB_PingTree_Phase1();
-	// second longer phase is querying the proxies for their ping data + dijkstra algo
-	Sys_SemWait(&phase2thread_lock);
-	if (Sys_CreateDetachedThread(SB_PingTree_Phase2, NULL) < 0) {
-		Com_Printf("Failed to create SB_PingTree_Phase2 thread\n");
-		building_pingtree = false;
-	}
-}
-
-/// Prints the shortest path to given IP address
-void SB_PingTree_DumpPath(const netadr_t *addr)
-{
-	nodeid_t target = SB_PingTree_FindIp(SB_Netaddr2Ipaddr(addr));
-
-	if (target == INVALID_NODE) {
-		Com_Printf("No route found to given host\n");
-	}
-	else {
-		nodeid_t current = target;
-
-		Com_Printf("Shortest path length: %d ms\nRoute: \n", ping_nodes[current].dist);
-		while (current != startnode_id && current != INVALID_NODE) {
-			byte *ip = ping_nodes[current].ipaddr.data;
-			Com_Printf("%4d ms  %d.%d.%d.%d:%d\n", ping_nodes[current].dist, 
-				ip[0], ip[1], ip[2], ip[3],	ntohs(ping_nodes[current].proxport));
-			current = ping_nodes[current].prev;
-		}
-		Com_Printf("%4d ms  localhost (your machine)\n", 0);
-	}
-}
-
-/**
- * Fills buf with the proxy chain string for the best path to addr,
- * in the format expected by cl_proxyaddr: "proxy1ip:port@proxy2ip:port"
- * (outermost proxy first, same order as SB_PingTree_ConnectBestPath uses).
- *
- * Returns true if a valid multi-hop proxy path was found and written to buf.
- * Returns false if no path exists or the direct route is already optimal
- * (buf is set to "" in both cases).
- *
- * out_total_ping_ms receives the Dijkstra distance to the target in ms.
- * It may be 0 if the tree has no distance data -- callers must handle this.
- */
-qbool SB_PingTree_GetProxyString(const netadr_t *addr, char *buf,
-                                  size_t buflen, int *out_total_ping_ms)
-{
-	nodeid_t target;
-
-	if (!buf || buflen == 0) return false;
-	buf[0] = '\0';
-
-	target = SB_PingTree_FindIp(SB_Netaddr2Ipaddr(addr));
-
-	if (target == INVALID_NODE || ping_nodes[target].prev == INVALID_NODE) {
-		/* No path at all */
-		return false;
-	}
-
-	if (out_total_ping_ms)
-		*out_total_ping_ms = (int)ping_nodes[target].dist;
-
-	if (ping_nodes[target].prev == startnode_id) {
-		/* Direct route is optimal -- no proxy needed */
-		return false;
 	}
 
 	{
-		/* Build proxy chain: walk prev pointers from target back to startnode,
-		   prepending each hop so the outermost proxy ends up first in the string.
-		   This matches the format used by cl_proxyaddr and ConnectBestPath. */
-		char proxylist_buf[32 * MAX_NONLEAVES];
-		nodeid_t current = ping_nodes[target].prev;
+		int timeout_ms = (int)cl_connectbr_timeout_ms.value;
+		if (timeout_ms <= 0) timeout_ms = 600;
+		double deadline = Sys_DoubleTime() + (timeout_ms / 1000.0);
 
-		proxylist_buf[0] = '\0';
+		while (Sys_DoubleTime() < deadline) {
+			char buf[32];
+			struct sockaddr_storage from_addr;
+			socklen_t from_len = sizeof(from_addr);
+			double now;
 
-		while (current != startnode_id && current != INVALID_NODE) {
-			byte *ip = ping_nodes[current].ipaddr.data;
-			char newval[2048];
+			FD_ZERO(&fd);
+			FD_SET(sock, &fd);
+			tv.tv_sec  = 0;
+			tv.tv_usec = 20 * 1000;
+			ret = select(sock + 1, &fd, NULL, NULL, &tv);
+			if (ret <= 0) continue;
 
-			snprintf(&newval[0], sizeof(newval), "%d.%d.%d.%d:%d%s%s",
-			         (int)ip[0], (int)ip[1], (int)ip[2], (int)ip[3],
-			         (int)ntohs(ping_nodes[current].proxport),
-			         proxylist_buf[0] ? "@" : "",
-			         proxylist_buf);
-			strlcpy(proxylist_buf, newval, sizeof(proxylist_buf));
+			ret = recvfrom(sock, buf, sizeof(buf), 0,
+			               (struct sockaddr *)&from_addr, &from_len);
+			if (ret <= 0)      continue;
+			if (buf[0] != 'l') continue;
 
-			current = ping_nodes[current].prev;
+			now = Sys_DoubleTime();
+			for (i = 0; i < test_packets; i++) {
+				if (!received[i]) {
+					received[i]   = true;
+					recv_times[i] = now;
+					recv_count++;
+					break;
+				}
+			}
 		}
-
-		if (proxylist_buf[0] == '\0')
-			return false; /* shouldn't happen, but be safe */
-
-		strlcpy(buf, proxylist_buf, buflen);
-		return true;
 	}
+
+	if (recv_count == 0) {
+		*out_ping = 9999;
+		*out_loss = 100;
+		goto cleanup;
+	}
+
+	for (i = 0; i < test_packets; i++) {
+		if (received[i])
+			ping_sum += (recv_times[i] - send_times[i]) * 1000.0;
+	}
+
+	*out_ping = (float)(ping_sum / recv_count);
+	*out_loss = (float)((test_packets - recv_count) * 100) / test_packets;
+	success   = true;
+
+cleanup:
+	if (sock != INVALID_SOCKET) closesocket(sock);
+	Q_free(send_times);
+	Q_free(recv_times);
+	Q_free(received);
+	return success;
 }
 
-int SB_PingTree_GetPathLen(const netadr_t *addr)
+// --------------------------------------------
+// Query a single proxy for its ping to the destination server.
+// Uses the qwfwd "pingstatus" packet -- same protocol the ping tree uses.
+// Returns proxy->dest ping in ms, or -1 if not found.
+// This is called only ONCE per connectbr (for the chosen proxy),
+// not in a loop -- so it does NOT cause freezing.
+// --------------------------------------------
+static int CL_BR_GetProxyToDestPing(const netadr_t *proxy_addr,
+                                     const netadr_t *dest_addr)
 {
-	nodeid_t target = SB_PingTree_FindIp(SB_Netaddr2Ipaddr(addr));
+	char packet[] = "\xff\xff\xff\xffpingstatus";
+	byte buf[8 * 512];
+	struct sockaddr_storage addr_to, addr_from;
+	socklen_t from_len;
+	struct timeval tv;
+	fd_set fd;
+	socket_t sock;
+	int ret, timeout_ms, result = -1;
 
-	if (target == INVALID_NODE || ping_nodes[target].prev == INVALID_NODE) {
-		return -1;
-	}
-	else if (ping_nodes[target].prev == startnode_id) {
-		return 0;
-	}
-	else {
-		nodeid_t current = ping_nodes[target].prev;
-		int proxies = 0;
+	sock = UDP_OpenSocket(PORT_ANY);
+	if (sock == INVALID_SOCKET) return -1;
 
-		while (current != startnode_id && current != INVALID_NODE) {
-			proxies++;
-			current = ping_nodes[current].prev;
+	NetadrToSockadr(proxy_addr, &addr_to);
+	ret = sendto(sock, packet, strlen(packet), 0,
+	             (struct sockaddr *)&addr_to, sizeof(struct sockaddr));
+	if (ret < 0) { closesocket(sock); return -1; }
+
+	timeout_ms = (int)cl_connectbr_timeout_ms.value;
+	if (timeout_ms <= 0) timeout_ms = 600;
+
+	FD_ZERO(&fd);
+	FD_SET(sock, &fd);
+	tv.tv_sec  = timeout_ms / 1000;
+	tv.tv_usec = (timeout_ms % 1000) * 1000;
+
+	ret = select(sock + 1, &fd, NULL, NULL, &tv);
+	if (ret > 0) {
+		from_len = sizeof(addr_from);
+		ret = recvfrom(sock, (char *)buf, sizeof(buf), 0,
+		               (struct sockaddr *)&addr_from, &from_len);
+		if (ret > 5 && memcmp(buf, "\xff\xff\xff\xffn", 5) == 0) {
+			const byte *p   = buf + 5;
+			const byte *end = buf + ret;
+			while (p + 8 <= end) {
+				/* pingstatus entry: 4B IP | 2B port (net-order) | 2B ping (little-endian) */
+				if (memcmp(p, dest_addr->ip, 4) == 0 &&
+				    memcmp(p + 4, &dest_addr->port, 2) == 0) {
+					short dist;
+					memcpy(&dist, p + 6, 2);
+					dist = (short)LittleShort(dist);
+					if (dist >= 0) result = (int)dist;
+					break;
+				}
+				p += 8;
+			}
 		}
-
-		return proxies;
 	}
+	closesocket(sock);
+	return result;
 }
 
-/// Connects to given QW server using the best available route
-void SB_PingTree_ConnectBestPath(const netadr_t *addr)
+// --------------------------------------------
+// Score -- lower is better, single absolute scale.
+// --------------------------------------------
+static float CL_BR_Score(float ping_ms, float loss_pct, qbool via_proxy)
+{
+	float o       = cl_connectbr_ping_orange.value > 0 ? cl_connectbr_ping_orange.value : 200.0f;
+	float w_ping  = cl_connectbr_weight_ping.value > 0 ? cl_connectbr_weight_ping.value : 0.6f;
+	float w_loss  = cl_connectbr_weight_loss.value > 0 ? cl_connectbr_weight_loss.value : 0.4f;
+	float norm_ping = ping_ms  / (o * 2.0f);
+	float norm_loss = loss_pct / 100.0f;
+	(void)via_proxy;
+	return w_ping * norm_ping + w_loss * norm_loss;
+}
+
+// --------------------------------------------
+// qsort comparator
+// --------------------------------------------
+static int CL_BR_RouteCompare(const void *a, const void *b)
+{
+	const route_t *ra = (const route_t *)a;
+	const route_t *rb = (const route_t *)b;
+	if (ra->score < rb->score) return -1;
+	if (ra->score > rb->score) return  1;
+	return 0;
+}
+
+// --------------------------------------------
+// Apply route and connect
+// --------------------------------------------
+static void CL_BR_ApplyRoute(int idx)
 {
 	extern cvar_t cl_proxyaddr;
-	nodeid_t target = SB_PingTree_FindIp(SB_Netaddr2Ipaddr(addr));
+	route_t *r = &br_routes[idx];
 
-	if (target == INVALID_NODE || ping_nodes[target].prev == INVALID_NODE) {
-		Com_Printf("No route found, trying to connect directly...\n");
-		Cvar_Set(&cl_proxyaddr, "");
-	}
-	else if (ping_nodes[target].prev == startnode_id) {
-		Com_Printf("Direct route is the best route, connecting directly...\n");
-		Cvar_Set(&cl_proxyaddr, "");
-	}
-	else {
-		char proxylist_buf[32*MAX_NONLEAVES] = "";
-		nodeid_t current = ping_nodes[target].prev;
-		int proxies = 0;
+	Cvar_Set(&cl_proxyaddr, "");
+	if (r->proxylist[0])
+		Cvar_Set(&cl_proxyaddr, r->proxylist);
 
-		while (current != startnode_id && current != INVALID_NODE) {
-			byte *ip = ping_nodes[current].ipaddr.data;
-			char newval[2048]; /* va() used 2048b buffer..*/
+	Com_Printf("\n&cf80connectbr:&r route #%d - %s\n", idx + 1, r->label);
+	Com_Printf("  ping: %s%.0fms&r  loss: %s%.0f%%&r\n",
+	           CL_BR_PingColor(r->ping_ms), r->ping_ms,
+	           CL_BR_LossColor(r->loss_pct), r->loss_pct);
 
-			snprintf(&newval[0], sizeof(newval), "%d.%d.%d.%d:%d%s%s", (int) ip[0], (int) ip[1], (int) ip[2],
-				(int) ip[3], (int) ntohs(ping_nodes[current].proxport), *proxylist_buf ? "@" : "", proxylist_buf);
-			strlcpy(proxylist_buf, newval, 32*MAX_NONLEAVES);
-
-			proxies++;
-			current = ping_nodes[current].prev;
-		}
-		
-		Com_Printf("Connecting using %d %s with best ping %d ms\n",
-			proxies, ((proxies == 1) ? "proxy" : "proxies"), ping_nodes[target].dist);
-		Cvar_Set(&cl_proxyaddr, proxylist_buf);
+	if (idx + 1 < br_route_count) {
+		Com_Printf("  type &cf80connectnext&r for route #%d (%s)\n",
+		           idx + 2, br_routes[idx + 1].label);
+	} else {
+		Com_Printf("  no more routes available.\n");
 	}
 
-	/* FIXME: Create a Cbuf_AddTextFmt? */
-	Cbuf_AddText("connect ");
-	Cbuf_AddText(NET_AdrToString(*addr));
-	Cbuf_AddText("\n");
+	Cbuf_AddText(va("connect %s\n", NET_AdrToString(br_target_addr)));
 }
 
-int SB_Proxylist_Unserialize(FILE *f)
+// --------------------------------------------
+// PUBLIC: connectbr <address>
+// --------------------------------------------
+void CL_Connect_BestRoute_f(void)
 {
-	int version, count = 0;
+	extern cvar_t cl_proxyaddr;
+	const char *addr;
+	int i;
 
-	if (fread(&version, sizeof(int), 1, f) != 1)
-		return -1;
-	if (version != PROXY_SERIALIZE_FILE_VERSION)
-		return -1;
-
-	while (!ferror(f) && !feof(f)) {
-		netadr_t proxy;
-		size_t buflen;
-		byte buf[PROXY_REPLY_BUFFER_SIZE];
-		nodeid_t id;
-
-		if (fread(&proxy, sizeof(netadr_t), 1, f) != 1)
-			return -3;
-
-		if (proxy.type == NA_INVALID)
-			break;
-
-		if (fread(&buflen, sizeof(size_t), 1, f) != 1)
-			return -3;
-		if (buflen > PROXY_REPLY_BUFFER_SIZE)
-			return -3;
-		if (fread(buf, buflen, 1, f) != 1)
-			return -3;
-
-		id = SB_PingTree_FindIp(SB_Netaddr2Ipaddr(&proxy));
-		if (id == INVALID_NODE)
-			return -3;
-
-		ping_nodes[id].nlist_start = ping_neighbours_count;
-		SB_Proxy_ParseReply(buf, buflen, SB_PingTree_AddProxyPing);
-		ping_nodes[id].nlist_end = ping_neighbours_count;
-
-		count++;
-	}
-
-	return count;
-}
-
-void SB_Proxylist_Unserialize_f(void)
-{
-	char filename[MAX_OSPATH] = {0};
-	FILE *f;
-	int err;
-	
-	snprintf(&filename[0], sizeof(filename), "%s/%s", com_homedir, "proxies_data");
-
-	if (!(f	= fopen(filename, "rb"))) {
-		Com_Printf("Couldn't read %s.\n", filename);
+	if (br_measuring) {
+		Com_Printf("connectbr: measurement already in progress, please wait.\n");
 		return;
 	}
 
-	building_pingtree = true;
-	pingtree_built = false;
-	SB_PingTree_Phase1();
-	err = SB_Proxylist_Unserialize(f);
-	if (err > 0) {
-		Com_Printf("Successfully read %d proxies\n", err);
-		SB_PingTree_Dijkstra();
-		SB_PingTree_UpdateServerList();
-		pingtree_built = true;
+	if (Cmd_Argc() != 2) {
+		Com_Printf("Usage: connectbr <address>\n");
+		Com_Printf("Tests all proxy routes and connects via the best one.\n");
+		Com_Printf("Use 'connectnext' to try the next route if needed.\n");
+		return;
 	}
-	else if (err == -1) {
-		Com_Printf("Format didn't match\n");
-	}
-	else if (err == -3) {
-		Com_Printf("Corrupted data\n");
-	}
-	else { // err == 0
-		Com_Printf("No proxies read\n");
-	}
-	building_pingtree = false;
 
-	fclose(f);
+	addr = Cmd_Argv(1);
+	if (!addr || *addr == '\0') {
+		Com_Printf("connectbr: empty address\n");
+		return;
+	}
+	if (strlen(addr) > MAX_ADDRESS_LENGTH) {
+		Com_Printf("connectbr: address too long\n");
+		return;
+	}
+
+	if (!NET_StringToAdr(addr, &br_target_addr)) {
+		Com_Printf("connectbr: invalid address '%s'\n", addr);
+		return;
+	}
+	if (br_target_addr.port == 0)
+		br_target_addr.port = htons(27500);
+
+	if (SB_PingTree_IsBuilding()) {
+		Com_Printf("connectbr: ping tree still building -- please wait and retry.\n");
+		return;
+	}
+
+	br_measuring     = true;
+	Cvar_Set(&cl_proxyaddr, "");
+	br_route_count   = 0;
+	br_current_route = 0;
+	br_active        = false;
+
+	if ((int)cl_connectbr_verbose.value >= 1) {
+		Com_Printf("\n&cf80connectbr:&r testing routes to %s...\n", addr);
+		Com_Printf("\n");
+	}
+
+	// ── Step 1: ping tree best route (includes real multi-hop via Dijkstra) ──
+	// The ping tree requires sb_findroutes to be enabled and sb_buildpingtree to have run.
+	// We enable sb_findroutes temporarily if needed, but only use the tree if already built.
+	if (SB_PingTree_Built() && !SB_PingTree_IsBuilding() && br_route_count < CONNECTBR_MAX_ROUTES - 1) {
+		int pathlen = SB_PingTree_GetPathLen(&br_target_addr);
+		if (pathlen > 0) {
+			int  total_ping_ms = 0;
+			char proxy_str[MAX_PROXYLIST];
+			proxy_str[0] = '\0';
+			if (SB_PingTree_GetProxyString(&br_target_addr, proxy_str,
+			                               sizeof(proxy_str), &total_ping_ms)
+			    && proxy_str[0] != '\0') {
+				/* Sanity: if the ping tree returned the destination itself as the
+				   only "relay", discard it -- we must not proxy through the target. */
+				{
+					char target_str[64];
+					snprintf(target_str, sizeof(target_str), "%d.%d.%d.%d:%d",
+					         br_target_addr.ip[0], br_target_addr.ip[1],
+					         br_target_addr.ip[2], br_target_addr.ip[3],
+					         ntohs(br_target_addr.port));
+					if (strcmp(proxy_str, target_str) == 0) {
+						if ((int)cl_connectbr_verbose.value >= 1)
+							Com_Printf("  [ping tree] proxy_str eh o proprio servidor destino -- ignorado.\n");
+						goto skip_pingtree_route;
+					}
+				}
+				/* Accept even if total_ping_ms is 0 -- rely on proxy_str validity */
+				float ping = (total_ping_ms > 0) ? (float)total_ping_ms : 1.0f;
+				Com_Printf("  [ping tree best (%d hop%s)]... ping=%s%.0fms&r  loss=%s0%%&r\n",
+				           pathlen, pathlen > 1 ? "s" : "",
+				           CL_BR_PingColor(ping), ping,
+				           CL_BR_LossColor(0));
+				strlcpy(br_routes[br_route_count].proxylist, proxy_str,
+				        sizeof(br_routes[0].proxylist));
+				snprintf(br_routes[br_route_count].label,
+				         sizeof(br_routes[0].label),
+				         "ping tree best (%d hop%s)",
+				         pathlen, pathlen > 1 ? "s" : "");
+				br_routes[br_route_count].ping_ms   = ping;
+				br_routes[br_route_count].loss_pct  = 0;
+				br_routes[br_route_count].score     = CL_BR_Score(ping, 0, true);
+				br_routes[br_route_count].via_proxy = true;
+				br_routes[br_route_count].valid     = true;
+				br_route_count++;
+			} else {
+				if ((int)cl_connectbr_verbose.value >= 1)
+					Com_Printf("  [ping tree] caminho encontrado (%d hop%s) mas proxy_str vazio -- ignorado.\n",
+					           pathlen, pathlen > 1 ? "s" : "");
+			}
+			skip_pingtree_route:;
+		} else {
+			if ((int)cl_connectbr_verbose.value >= 1)
+				Com_Printf("  [ping tree] nenhum caminho para %s -- multi-hop indisponivel.\n", addr);
+		}
+	} else if (!SB_PingTree_Built() || SB_PingTree_IsBuilding()) {
+		if ((int)cl_connectbr_verbose.value >= 1)
+			Com_Printf("  [ping tree] ainda nao construido -- sem multi-hop. Use 'sb_findroutes 1' e 'sb_buildpingtree' antes.\n");
+	}
+
+	// ── Step 2: individual proxies from browser + hardcoded fallback ──
+	// For each proxy: measure you->proxy ping, then query that single proxy
+	// for its ping to the destination (proxy->dest). Total = you->proxy + proxy->dest.
+	// This is ONE pingstatus call per proxy -- not a full graph scan -- so it
+	// does not block the client.
+	{
+		char proxy_ips  [CONNECTBR_MAX_PROXIES][64];
+		char proxy_names[CONNECTBR_MAX_PROXIES][128];
+		int  proxy_pings[CONNECTBR_MAX_PROXIES];   /* browser ping for pre-sort */
+		int  proxy_count = 0;
+
+		SB_ServerList_Lock();
+		for (i = 0; i < serversn && proxy_count < CONNECTBR_MAX_PROXIES; i++) {
+			server_data *s = servers[i];
+			char proxy_ip[64];
+			int j;
+			qbool dup = false;
+
+			if (!s) continue;
+			if (ntohs(s->address.port) != 30000) continue;  /* only port 30000 = proxy */
+			if (s->ping < 0) continue;
+			/* skip if this proxy IS the destination server (same IP and same port) */
+			if (memcmp(s->address.ip,   br_target_addr.ip,   4) == 0 &&
+			    s->address.port == br_target_addr.port) continue;
+
+			snprintf(proxy_ip, sizeof(proxy_ip), "%d.%d.%d.%d:%d",
+			         s->address.ip[0], s->address.ip[1],
+			         s->address.ip[2], s->address.ip[3],
+			         ntohs(s->address.port));
+
+			for (j = 0; j < br_route_count && !dup; j++)
+				if (strcmp(br_routes[j].proxylist, proxy_ip) == 0) dup = true;
+			for (j = 0; j < proxy_count && !dup; j++)
+				if (strcmp(proxy_ips[j], proxy_ip) == 0) dup = true;
+			if (dup) continue;
+
+			strlcpy(proxy_ips  [proxy_count], proxy_ip, sizeof(proxy_ips[0]));
+			strlcpy(proxy_names[proxy_count],
+			        s->display.name[0] ? s->display.name : proxy_ip,
+			        sizeof(proxy_names[0]));
+			proxy_pings[proxy_count] = s->ping;  /* keep browser ping for sorting */
+			proxy_count++;
+		}
+		SB_ServerList_Unlock();
+
+		/* Sort proxy list by browser ping ascending (insertion sort on parallel arrays).
+		   This ensures that the lowest-ping proxies are measured and printed first. */
+		{
+			int ii, jj;
+			for (ii = 1; ii < proxy_count; ii++) {
+				char   tmp_ip  [64];
+				char   tmp_name[128];
+				int    tmp_ping = proxy_pings[ii];
+				strlcpy(tmp_ip,   proxy_ips  [ii], sizeof(tmp_ip));
+				strlcpy(tmp_name, proxy_names[ii], sizeof(tmp_name));
+				for (jj = ii - 1; jj >= 0 && proxy_pings[jj] > tmp_ping; jj--) {
+					proxy_pings[jj + 1] = proxy_pings[jj];
+					strlcpy(proxy_ips  [jj + 1], proxy_ips  [jj], sizeof(proxy_ips  [0]));
+					strlcpy(proxy_names[jj + 1], proxy_names[jj], sizeof(proxy_names[0]));
+				}
+				proxy_pings[jj + 1] = tmp_ping;
+				strlcpy(proxy_ips  [jj + 1], tmp_ip,   sizeof(proxy_ips  [0]));
+				strlcpy(proxy_names[jj + 1], tmp_name, sizeof(proxy_names[0]));
+			}
+		}
+
+		// Hardcoded fallback if browser empty
+		if (proxy_count == 0) {
+			int k;
+			for (k = 0; br_known_proxies[k] && proxy_count < CONNECTBR_MAX_PROXIES; k++) {
+				netadr_t kaddr;
+				int j;
+				qbool dup = false;
+				if (!NET_StringToAdr(br_known_proxies[k], &kaddr)) continue;
+				/* skip if this hardcoded proxy IS the destination server */
+				if (memcmp(kaddr.ip,   br_target_addr.ip,   4) == 0 &&
+				    kaddr.port == br_target_addr.port) continue;
+				for (j = 0; j < br_route_count && !dup; j++)
+					if (strcmp(br_routes[j].proxylist, br_known_proxies[k]) == 0) dup = true;
+				for (j = 0; j < proxy_count && !dup; j++)
+					if (strcmp(proxy_ips[j], br_known_proxies[k]) == 0) dup = true;
+				if (dup) continue;
+				strlcpy(proxy_ips  [proxy_count], br_known_proxies[k], sizeof(proxy_ips[0]));
+				strlcpy(proxy_names[proxy_count], br_known_proxies[k], sizeof(proxy_names[0]));
+				proxy_count++;
+			}
+		}
+
+		// Measure each proxy: you->proxy + proxy->dest
+		for (i = 0; i < proxy_count && br_route_count < CONNECTBR_MAX_ROUTES - 1; i++) {
+			netadr_t proxy_adr;
+			int ping_you_proxy, proxy_to_dest, total_ping;
+			float fping, floss;
+
+			if (!NET_StringToAdr(proxy_ips[i], &proxy_adr)) continue;
+
+			// you -> proxy
+			ping_you_proxy = CL_BR_GetBrowserPing(&proxy_adr);
+			if (ping_you_proxy < 0) {
+				if (!CL_BR_MeasureHop(&proxy_adr, &fping, &floss)) {
+					Com_Printf("  [%s]... &cf00unreachable&r\n", proxy_names[i]);
+					continue;
+				}
+				ping_you_proxy = (int)fping;
+			}
+
+			// proxy -> dest (single pingstatus query -- does NOT block for long)
+			proxy_to_dest = CL_BR_GetProxyToDestPing(&proxy_adr, &br_target_addr);
+			if (proxy_to_dest < 0) {
+				// proxy doesn't know about dest -- use direct ping as estimate
+				int direct = CL_BR_GetBrowserPing(&br_target_addr);
+				proxy_to_dest = (direct > 0) ? direct : ping_you_proxy;
+			}
+
+			total_ping = ping_you_proxy + proxy_to_dest;
+
+			Com_Printf("  [%s]... ping=%s%dms&r  loss=%s0%%&r\n",
+			           proxy_names[i],
+			           CL_BR_PingColor((float)total_ping), total_ping,
+			           CL_BR_LossColor(0));
+
+			strlcpy(br_routes[br_route_count].proxylist, proxy_ips[i],
+			        sizeof(br_routes[0].proxylist));
+			snprintf(br_routes[br_route_count].label,
+			         sizeof(br_routes[0].label),
+			         "via proxy %s", proxy_names[i]);
+			br_routes[br_route_count].ping_ms   = (float)total_ping;
+			br_routes[br_route_count].loss_pct  = 0;
+			br_routes[br_route_count].score     = CL_BR_Score((float)total_ping, 0, true);
+			br_routes[br_route_count].via_proxy = true;
+			br_routes[br_route_count].valid     = true;
+			br_route_count++;
+		}
+	}
+
+	// ── Step 3: direct connection ──
+	if (br_route_count < CONNECTBR_MAX_ROUTES) {
+		int dp = CL_BR_GetBrowserPing(&br_target_addr);
+		if (dp < 0) {
+			float fping, floss;
+			if (CL_BR_MeasureHop(&br_target_addr, &fping, &floss))
+				dp = (int)fping;
+		}
+		if (dp > 0) {
+			Com_Printf("  [direct]... ping=%s%dms&r  loss=%s0%%&r\n",
+			           CL_BR_PingColor((float)dp), dp,
+			           CL_BR_LossColor(0));
+			br_routes[br_route_count].proxylist[0] = '\0';
+			strlcpy(br_routes[br_route_count].label, "direct connection",
+			        sizeof(br_routes[0].label));
+			br_routes[br_route_count].ping_ms   = (float)dp;
+			br_routes[br_route_count].loss_pct  = 0;
+			br_routes[br_route_count].score     = CL_BR_Score((float)dp, 0, false);
+			br_routes[br_route_count].via_proxy = false;
+			br_routes[br_route_count].valid     = true;
+			br_route_count++;
+		} else {
+			Com_Printf("  [direct]... &cf00unreachable&r\n");
+		}
+	}
+
+	br_measuring = false;
+
+	if (br_route_count == 0) {
+		Com_Printf("\nconnectbr: all routes failed.\n");
+		return;
+	}
+
+	// Sort by score
+	qsort(br_routes, br_route_count, sizeof(route_t), CL_BR_RouteCompare);
+
+	// Filter unplayable routes
+	{
+		int max_ping = (int)cl_connectbr_ping_orange.value;
+		int usable   = 0;
+		if (max_ping <= 0) max_ping = 200;
+		for (i = 0; i < br_route_count; i++) {
+			if (br_routes[i].ping_ms <= max_ping) {
+				if (i != usable)
+					br_routes[usable] = br_routes[i];
+				usable++;
+			}
+		}
+		if (usable < br_route_count) {
+			Com_Printf("  (%d route(s) with ping >%dms removed -- unplayable)\n",
+			           br_route_count - usable, max_ping);
+			br_route_count = usable;
+		}
+	}
+
+	if (br_route_count == 0) {
+		Com_Printf("\nconnectbr: all routes have ping above %dms -- unplayable.\n",
+		           (int)cl_connectbr_ping_orange.value > 0 ? (int)cl_connectbr_ping_orange.value : 200);
+		br_active = false;
+		return;
+	}
+
+	// Show ranking
+	Com_Printf("\n&cf80--- route ranking ---&r\n");
+	for (i = 0; i < br_route_count; i++) {
+		Com_Printf("  #%d %s\n     ping=%s%.0fms&r  loss=%s%.0f%%&r\n",
+		           i + 1, br_routes[i].label,
+		           CL_BR_PingColor(br_routes[i].ping_ms), br_routes[i].ping_ms,
+		           CL_BR_LossColor(br_routes[i].loss_pct), br_routes[i].loss_pct);
+	}
+
+	br_current_route = 0;
+	br_active        = true;
+	CL_BR_ApplyRoute(0);
 }
 
-qbool SB_PingTree_IsBuilding(void)
+// --------------------------------------------
+// PUBLIC: connectnext
+// --------------------------------------------
+void CL_Connect_Next_f(void)
 {
-	return building_pingtree;
+	if (!br_active || br_route_count == 0) {
+		Com_Printf("connectnext: no active connectbr session.\n");
+		Com_Printf("  Use 'connectbr <address>' first.\n");
+		return;
+	}
+
+	br_current_route++;
+
+	if (br_current_route >= br_route_count) {
+		Com_Printf("connectnext: no more routes (tried all %d).\n", br_route_count);
+		br_active = false;
+		return;
+	}
+
+	Host_EndGame();
+	CL_BR_ApplyRoute(br_current_route);
 }
 
-void SB_PingTree_Init(void)
+// --------------------------------------------
+// PUBLIC: register cvars
+// --------------------------------------------
+void CL_ConnectBR_Init(void)
 {
-	ping_neighbours_max = MAX_SERVERS_BLOCKSIZE;
-	ping_neighbours = Q_malloc(ping_neighbours_max * sizeof(ping_neighbour_t));
-	Sys_SemInit(&phase2thread_lock, 1, 1);
-}
-
-void SB_PingTree_Shutdown(void)
-{
-	Sys_SemWait(&phase2thread_lock);
-	Sys_SemDestroy(&phase2thread_lock);
-	Q_free(ping_neighbours);
-	ping_neighbours = NULL;
-	ping_neighbours_max = 0;
+	Cvar_SetCurrentGroup(CVAR_GROUP_NETWORK);
+	Cvar_Register(&cl_connectbr_test_packets);
+	Cvar_Register(&cl_connectbr_timeout_ms);
+	Cvar_Register(&cl_connectbr_packet_delay);
+	Cvar_Register(&cl_connectbr_ping_green);
+	Cvar_Register(&cl_connectbr_ping_yellow);
+	Cvar_Register(&cl_connectbr_ping_orange);
+	Cvar_Register(&cl_connectbr_weight_ping);
+	Cvar_Register(&cl_connectbr_weight_loss);
+	Cvar_Register(&cl_connectbr_verbose);
+	Cvar_Register(&cl_connectbr_debug);
+	Cvar_ResetCurrentGroup();
 }
