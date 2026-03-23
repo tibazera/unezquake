@@ -22,13 +22,30 @@ and picks the best combined path.
 #define WEIGHT_JITTER   0.3f
 #define WEIGHT_LOSS     0.2f
 
+// Ping normalisation references.
+//
+// These are the "expected good" ping ceilings for each route type.
+// A ping AT this value scores 0.50 on the ping component (neutral).
+// Below = good, above = bad — but the curve is gradual, not a cliff.
+//
+// Direct connection:  <50ms great, 80ms ok.    Reference = 80ms.
+// Via proxy (Miami, Lisboa, etc.): <100ms great, 130ms good, 160ms ok.
+//                                              Reference = 160ms.
+//
+// This means a 130ms proxy route scores well and is NOT penalised against
+// a 50ms direct route just because the absolute number is higher.
+#define PING_REF_DIRECT_MS    80.0f
+#define PING_REF_PROXY_MS    160.0f
+
 typedef struct route_candidate_s {
 	char    proxylist[512];  // value for cl_proxyaddr (empty = direct)
 	char    label[128];      // human-readable name
-	float   ping_ms;         // estimated total ping via this route
+	float   ping_ms;         // estimated total ping via this route (proxy + server)
 	float   jitter_ms;       // measured jitter to first hop
 	float   loss_pct;        // measured packet loss to first hop
 	float   score;           // lower = better
+	float   proxy_ping_ms;   // raw ping to first hop proxy (for display)
+	qbool   via_proxy;       // true if route goes through at least one proxy
 	qbool   valid;
 } route_candidate_t;
 
@@ -144,13 +161,27 @@ static qbool CL_BR_MeasureHop(const netadr_t *dest,
 }
 
 // ─────────────────────────────────────────────
-// Score a route (lower = better)
+// Score a route (lower = better).
+//
+// Ping is normalised against a reference that depends on route type:
+//
+//   Direct:     reference = PING_REF_DIRECT_MS (80ms)
+//     40ms → 0.25 (great)   80ms → 0.50 (ok)   160ms → 1.0 (bad)
+//
+//   Via proxy:  reference = PING_REF_PROXY_MS (160ms)
+//     80ms → 0.25 (great)  130ms → 0.41 (good)  160ms → 0.50 (ok)
+//
+// A 130ms proxy route scores 0.41 — clearly good.
+// A 50ms direct route scores 0.31 — slightly better but comparable.
+// Neither unfairly dominates the other.
 // ─────────────────────────────────────────────
-static float CL_BR_Score(float ping, float jitter, float loss)
+static float CL_BR_Score(float total_ping, float jitter, float loss,
+                          qbool via_proxy)
 {
-	float norm_ping   = ping   / 500.0f;
-	float norm_jitter = jitter / 100.0f;
-	float norm_loss   = loss   / 100.0f;
+	float ping_ref    = via_proxy ? PING_REF_PROXY_MS : PING_REF_DIRECT_MS;
+	float norm_ping   = total_ping / (ping_ref * 2.0f);
+	float norm_jitter = jitter     / 100.0f;
+	float norm_loss   = loss       / 100.0f;
 
 	return (WEIGHT_PING   * norm_ping)   +
 	       (WEIGHT_JITTER * norm_jitter) +
@@ -158,13 +189,26 @@ static float CL_BR_Score(float ping, float jitter, float loss)
 }
 
 // ─────────────────────────────────────────────
-// Build candidate list from ping tree data
+// Parse the FIRST proxy in a chain (closest to us).
 //
-// The ping tree already ran Dijkstra considering:
-//   our_ping_to_proxy + proxy_ping_to_server
-//
-// We enumerate all proxies that have a path to the
-// target server and build up to MAX_ROUTES candidates.
+// qwfwd chain format: "proxy1@proxy2@proxy3"
+// The client connects to proxy1 first — that is our first hop.
+// ─────────────────────────────────────────────
+static void CL_BR_GetFirstHop(const char *proxylist, char *out, size_t outsz)
+{
+	const char *at = strchr(proxylist, '@');
+	if (at) {
+		size_t len = (size_t)(at - proxylist);
+		if (len >= outsz) len = outsz - 1;
+		memcpy(out, proxylist, len);
+		out[len] = '\0';
+	} else {
+		strlcpy(out, proxylist, outsz);
+	}
+}
+
+// ─────────────────────────────────────────────
+// Build candidate list from ping tree + server list.
 // ─────────────────────────────────────────────
 static int CL_BR_BuildCandidates(const netadr_t *addr,
                                   route_candidate_t *candidates)
@@ -187,21 +231,18 @@ static int CL_BR_BuildCandidates(const netadr_t *addr,
 		        sizeof(candidates[count].proxylist));
 		snprintf(candidates[count].label, sizeof(candidates[count].label),
 		         "ping tree best (%d hop%s)", pathlen, pathlen > 1 ? "s" : "");
-		// Use the total estimated ping from Dijkstra as base ping
-		// We'll refine with real measurement below
-		candidates[count].ping_ms = 0; // will be measured
+		candidates[count].ping_ms   = 0;
+		candidates[count].via_proxy = (candidates[count].proxylist[0] != '\0');
 		count++;
 		Cvar_Set(&cl_proxyaddr, saved_proxy);
 	}
 
 	// --- Try each proxy in the server list individually ---
-	// This allows us to test proxies that might not be
-	// the ping tree's top choice but may have better
-	// jitter/loss characteristics (e.g. the nordeste proxy)
 	SB_ServerList_Lock();
 	for (i = 0; i < serversn && count < CONNECTBR_MAX_ROUTES - 1; i++) {
 		server_data *s = servers[i];
 		char proxy_ip[64];
+		float total_estimated_ping;
 
 		if (!s->qwfwd) continue;
 		if (s->ping < 0) continue;
@@ -211,15 +252,26 @@ static int CL_BR_BuildCandidates(const netadr_t *addr,
 		         s->address.ip[2], s->address.ip[3],
 		         ntohs(s->address.port));
 
-		// Skip if already added as best path
 		if (count > 0 && strcmp(candidates[0].proxylist, proxy_ip) == 0)
 			continue;
+
+#ifdef HAVE_PROXY_SERVER_PING
+		total_estimated_ping = (float)s->ping + (float)s->ping_to_server;
+#else
+		// Conservative estimate: proxy->server adds roughly the same as
+		// our ping to the proxy. Prevents a geographically distant proxy
+		// with a low our->proxy ping (e.g. Lisboa) from beating a closer
+		// proxy that has a shorter total path to the target server.
+		total_estimated_ping = (float)s->ping * 2.0f;
+#endif
 
 		strlcpy(candidates[count].proxylist, proxy_ip,
 		        sizeof(candidates[count].proxylist));
 		snprintf(candidates[count].label, sizeof(candidates[count].label),
 		         "via proxy %s", s->display.name[0] ? s->display.name : proxy_ip);
-		candidates[count].ping_ms = (float)s->ping; // direct ping to proxy
+		candidates[count].ping_ms       = total_estimated_ping;
+		candidates[count].proxy_ping_ms = (float)s->ping;
+		candidates[count].via_proxy     = true;
 		count++;
 	}
 	SB_ServerList_Unlock();
@@ -228,7 +280,8 @@ static int CL_BR_BuildCandidates(const netadr_t *addr,
 	candidates[count].proxylist[0] = '\0';
 	strlcpy(candidates[count].label, "direct connection",
 	        sizeof(candidates[count].label));
-	candidates[count].ping_ms = 0;
+	candidates[count].ping_ms   = 0;
+	candidates[count].via_proxy = false;
 	count++;
 
 	return count;
@@ -246,7 +299,7 @@ static void CL_BR_ApplyRoute(int idx)
 
 	Com_Printf("\n&cf80connectbr:&r Connecting via route #%d — %s\n",
 	           idx + 1, r->label);
-	Com_Printf("  ping:&cf80%.0fms&r  jitter:&cf80%.0fms&r  loss:&cf80%.0f%%&r\n",
+	Com_Printf("  ping (total est.):&cf80%.0fms&r  jitter:&cf80%.0fms&r  loss:&cf80%.0f%%&r\n",
 	           r->ping_ms, r->jitter_ms, r->loss_pct);
 
 	if (idx + 1 < br_route_count) {
@@ -311,47 +364,49 @@ void CL_Connect_BestRoute_f(void)
 	br_active        = false;
 
 	for (i = 0; i < candidate_count && br_route_count < CONNECTBR_MAX_ROUTES; i++) {
-		float ping, jitter, loss;
+		float hop_ping, jitter, loss;
+		float total_ping;
 		qbool ok;
 		netadr_t hop_addr;
+		char first_hop[64];
 
 		Com_Printf("  [%d/%d] %s... ", i + 1, candidate_count, candidates[i].label);
 
-		// Measure quality of the FIRST HOP:
-		// - For proxy routes: measure ping to the proxy itself
-		// - For direct: measure ping to the server
 		if (candidates[i].proxylist[0]) {
-			// Parse the first proxy in the chain
-			char first_hop[64];
-			char *at = strchr(candidates[i].proxylist, '@');
-			if (at) {
-				// Multiple proxies: take the last one (closest to us)
-				strlcpy(first_hop, at + 1, sizeof(first_hop));
-			} else {
-				strlcpy(first_hop, candidates[i].proxylist, sizeof(first_hop));
-			}
+			CL_BR_GetFirstHop(candidates[i].proxylist, first_hop, sizeof(first_hop));
 			NET_StringToAdr(first_hop, &hop_addr);
 		} else {
-			// Direct: measure to the server
 			hop_addr = br_target_addr;
 		}
 
-		ok = CL_BR_MeasureHop(&hop_addr, &ping, &jitter, &loss);
+		ok = CL_BR_MeasureHop(&hop_addr, &hop_ping, &jitter, &loss);
 
 		if (!ok) {
 			Com_Printf("&cf00unreachable&r\n");
 			continue;
 		}
 
-		br_routes[br_route_count]           = candidates[i];
-		br_routes[br_route_count].ping_ms   = ping;
-		br_routes[br_route_count].jitter_ms = jitter;
-		br_routes[br_route_count].loss_pct  = loss;
-		br_routes[br_route_count].score     = CL_BR_Score(ping, jitter, loss);
-		br_routes[br_route_count].valid     = true;
+		// Replace the estimated first-hop component with the measured value,
+		// keeping the remainder of the estimated path (proxy -> server).
+		if (candidates[i].via_proxy && candidates[i].proxy_ping_ms > 0) {
+			float remaining = candidates[i].ping_ms - candidates[i].proxy_ping_ms;
+			if (remaining < 0) remaining = 0;
+			total_ping = hop_ping + remaining;
+		} else {
+			total_ping = hop_ping;
+		}
 
-		Com_Printf("ping=&cf80%.0fms&r  jitter=&cf80%.0fms&r  loss=&cf80%.0f%%&r\n",
-		           ping, jitter, loss);
+		br_routes[br_route_count]               = candidates[i];
+		br_routes[br_route_count].ping_ms       = total_ping;
+		br_routes[br_route_count].proxy_ping_ms = hop_ping;
+		br_routes[br_route_count].jitter_ms     = jitter;
+		br_routes[br_route_count].loss_pct      = loss;
+		br_routes[br_route_count].score         = CL_BR_Score(total_ping, jitter, loss,
+		                                                       candidates[i].via_proxy);
+		br_routes[br_route_count].valid         = true;
+
+		Com_Printf("hop=&cf80%.0fms&r  total_est=&cf80%.0fms&r  jitter=&cf80%.0fms&r  loss=&cf80%.0f%%&r\n",
+		           hop_ping, total_ping, jitter, loss);
 		br_route_count++;
 	}
 
@@ -360,7 +415,7 @@ void CL_Connect_BestRoute_f(void)
 		return;
 	}
 
-	// Sort by score
+	// Sort by score (lower = better)
 	{
 		int a, b;
 		for (a = 0; a < br_route_count - 1; a++) {
@@ -378,8 +433,9 @@ void CL_Connect_BestRoute_f(void)
 	Com_Printf("\n&cf80--- Route ranking ---&r\n");
 	for (i = 0; i < br_route_count; i++) {
 		Com_Printf("  #%d %s\n"
-		           "     ping=%.0fms  jitter=%.0fms  loss=%.0f%%\n",
+		           "     hop=%.0fms  total_est=%.0fms  jitter=%.0fms  loss=%.0f%%\n",
 		           i + 1, br_routes[i].label,
+		           br_routes[i].proxy_ping_ms,
 		           br_routes[i].ping_ms,
 		           br_routes[i].jitter_ms,
 		           br_routes[i].loss_pct);
