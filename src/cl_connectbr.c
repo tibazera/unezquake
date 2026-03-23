@@ -46,10 +46,6 @@ cvar_t cl_connectbr_debug         = {"cl_connectbr_debug",         "0",    CVAR_
 #define MAX_PROXYLIST           256
 #define MAX_ADDRESS_LENGTH      128
 
-// Proxy measurement cache
-#define PROXY_CACHE_SIZE        16
-#define PROXY_CACHE_TTL_SEC     5.0
-
 // Debug macro
 #define BR_Debug(...) \
 	do { if (cl_connectbr_debug.value) Com_Printf("[connectbr] " __VA_ARGS__); } while(0)
@@ -190,13 +186,6 @@ typedef struct {
 	qbool   valid;
 } route_t;
 
-typedef struct {
-	char    proxy_ip[64];
-	float   ping_ms;
-	float   loss_pct;
-	double  last_measure;
-} proxy_cache_entry_t;
-
 // ─────────────────────────────────────────────
 // State
 // ─────────────────────────────────────────────
@@ -206,9 +195,6 @@ static int                  br_current_route = 0;
 static netadr_t             br_target_addr;
 static qbool                br_active        = false;
 static qbool                br_measuring     = false;
-
-static proxy_cache_entry_t  proxy_cache[PROXY_CACHE_SIZE];
-static int                  proxy_cache_count = 0;
 
 // ─────────────────────────────────────────────
 // Colour helpers
@@ -233,65 +219,6 @@ static const char *CL_BR_LossColor(float pct)
 	if (pct <= 0) return "&c0f0";  // green  -- 0% loss
 	if (pct <= 5) return "&cff0";  // yellow -- up to 5%
 	return "&cf00";                // red    -- >5% unacceptable
-}
-
-// ─────────────────────────────────────────────
-// Proxy measurement cache
-// ─────────────────────────────────────────────
-static qbool CL_BR_GetCached(const char *proxy_ip, float *ping, float *loss)
-{
-	int i;
-	double now = Sys_DoubleTime();
-	for (i = 0; i < proxy_cache_count; i++) {
-		if (strcmp(proxy_cache[i].proxy_ip, proxy_ip) == 0 &&
-		    (now - proxy_cache[i].last_measure) < PROXY_CACHE_TTL_SEC) {
-			*ping = proxy_cache[i].ping_ms;
-			*loss = proxy_cache[i].loss_pct;
-			BR_Debug("cache hit for %s: ping=%.0f loss=%.0f\n",
-			         proxy_ip, *ping, *loss);
-			return true;
-		}
-	}
-	return false;
-}
-
-static void CL_BR_StoreCached(const char *proxy_ip, float ping, float loss)
-{
-	int i;
-	double now = Sys_DoubleTime();
-
-	for (i = 0; i < proxy_cache_count; i++) {
-		if (strcmp(proxy_cache[i].proxy_ip, proxy_ip) == 0) {
-			proxy_cache[i].ping_ms      = ping;
-			proxy_cache[i].loss_pct     = loss;
-			proxy_cache[i].last_measure = now;
-			return;
-		}
-	}
-
-	if (proxy_cache_count < PROXY_CACHE_SIZE) {
-		strlcpy(proxy_cache[proxy_cache_count].proxy_ip, proxy_ip,
-		        sizeof(proxy_cache[0].proxy_ip));
-		proxy_cache[proxy_cache_count].ping_ms      = ping;
-		proxy_cache[proxy_cache_count].loss_pct     = loss;
-		proxy_cache[proxy_cache_count].last_measure = now;
-		proxy_cache_count++;
-	} else {
-		// Replace oldest entry
-		int oldest = 0;
-		double oldest_time = proxy_cache[0].last_measure;
-		for (i = 1; i < PROXY_CACHE_SIZE; i++) {
-			if (proxy_cache[i].last_measure < oldest_time) {
-				oldest_time = proxy_cache[i].last_measure;
-				oldest = i;
-			}
-		}
-		strlcpy(proxy_cache[oldest].proxy_ip, proxy_ip,
-		        sizeof(proxy_cache[oldest].proxy_ip));
-		proxy_cache[oldest].ping_ms      = ping;
-		proxy_cache[oldest].loss_pct     = loss;
-		proxy_cache[oldest].last_measure = now;
-	}
 }
 
 // ─────────────────────────────────────────────
@@ -453,22 +380,6 @@ static int CL_BR_RouteCompare(const void *a, const void *b)
 }
 
 // ─────────────────────────────────────────────
-// First proxy in chain (closest hop to us)
-// ─────────────────────────────────────────────
-static void CL_BR_GetFirstHop(const char *proxylist, char *out, size_t outsz)
-{
-	const char *at = strchr(proxylist, '@');
-	if (at) {
-		size_t len = (size_t)(at - proxylist);
-		if (len >= outsz) len = outsz - 1;
-		memcpy(out, proxylist, len);
-		out[len] = '\0';
-	} else {
-		strlcpy(out, proxylist, outsz);
-	}
-}
-
-// ─────────────────────────────────────────────
 // Query a proxy for its full pingstatus list.
 // For each entry calls the callback with (ip, port_net, ping_ms).
 // ─────────────────────────────────────────────
@@ -537,6 +448,17 @@ static void CL_BR_EdgeCallback(const byte ip[4], unsigned short port_net,
 	nb = CL_BR_Graph_AddNode(ip, port_net);
 	CL_BR_Graph_AddEdge(d->proxy_node, nb, ping_ms);
 }
+
+// ─────────────────────────────────────────────
+// Known QW proxy fallback list (used when server browser is empty)
+// ─────────────────────────────────────────────
+static const char *br_known_proxies[] = {
+	"177.93.132.220:30000",   // ! Pent @ Ilha QWFWD
+	"103.63.29.40:30000",     // ! Qlash Lisbon | Antilag QWFWD
+	"arenacamper.ddns.net:30000",
+	"berlin.qwsv.net:30000",
+	NULL
+};
 
 // ─────────────────────────────────────────────
 // Build multi-hop graph, run Dijkstra, extract all routes.
@@ -762,17 +684,6 @@ static void CL_BR_ApplyRoute(int idx)
 }
 
 // ─────────────────────────────────────────────
-// Known QW proxy fallback list (used when server browser is empty)
-// ─────────────────────────────────────────────
-static const char *br_known_proxies[] = {
-	"177.93.132.220:30000",   // ! Pent @ Ilha QWFWD
-	"103.63.29.40:30000",     // ! Qlash Lisbon | Antilag QWFWD
-	"arenacamper.ddns.net:30000",
-	"berlin.qwsv.net:30000",
-	NULL
-};
-
-// ─────────────────────────────────────────────
 // PUBLIC: connectbr <address>
 // ─────────────────────────────────────────────
 void CL_Connect_BestRoute_f(void)
@@ -824,7 +735,6 @@ void CL_Connect_BestRoute_f(void)
 	br_active        = false;
 
 	// Clear proxy cache so stale data from a previous connectbr call is not reused
-	proxy_cache_count = 0;
 
 	if ((int)cl_connectbr_verbose.value >= 1) {
 		Com_Printf("\n&cf80connectbr:&r testing routes to %s...\n", addr);
