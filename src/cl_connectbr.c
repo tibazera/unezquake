@@ -13,7 +13,7 @@ CVars:
   cl_connectbr_packet_delay   - ms between probes (default 15)
   cl_connectbr_ping_green     - ping threshold for green colour (default 40 ms)
   cl_connectbr_ping_yellow    - ping threshold for yellow colour (default 80 ms)
-  cl_connectbr_ping_orange    - ping threshold for orange colour (default 130 ms); above = red (unplayable)
+  cl_connectbr_ping_orange    - ping threshold for orange colour (default 200 ms); above = red (unplayable)
   cl_connectbr_weight_ping    - score weight for ping (default 0.6)
   cl_connectbr_weight_loss    - score weight for loss (default 0.4)
   cl_connectbr_verbose        - verbosity level 0/1/2 (default 1)
@@ -32,7 +32,7 @@ cvar_t cl_connectbr_timeout_ms    = {"cl_connectbr_timeout_ms",    "600",  CVAR_
 cvar_t cl_connectbr_packet_delay  = {"cl_connectbr_packet_delay",  "15",   CVAR_ARCHIVE};
 cvar_t cl_connectbr_ping_green    = {"cl_connectbr_ping_green",    "40",   CVAR_ARCHIVE};  // <= 40ms green
 cvar_t cl_connectbr_ping_yellow   = {"cl_connectbr_ping_yellow",   "80",   CVAR_ARCHIVE};  // <= 80ms yellow
-cvar_t cl_connectbr_ping_orange   = {"cl_connectbr_ping_orange",   "130",  CVAR_ARCHIVE};  // <= 130ms orange, >130 red (unplayable)
+cvar_t cl_connectbr_ping_orange   = {"cl_connectbr_ping_orange",   "200",  CVAR_ARCHIVE};  // <= 200ms orange, >200ms red (unplayable)
 cvar_t cl_connectbr_weight_ping   = {"cl_connectbr_weight_ping",   "0.6",  CVAR_ARCHIVE};
 cvar_t cl_connectbr_weight_loss   = {"cl_connectbr_weight_loss",   "0.4",  CVAR_ARCHIVE};
 cvar_t cl_connectbr_verbose       = {"cl_connectbr_verbose",       "1",    CVAR_ARCHIVE};
@@ -55,8 +55,131 @@ cvar_t cl_connectbr_debug         = {"cl_connectbr_debug",         "0",    CVAR_
 	do { if (cl_connectbr_debug.value) Com_Printf("[connectbr] " __VA_ARGS__); } while(0)
 
 // ─────────────────────────────────────────────
-// Types
+// Mini ping graph -- Dijkstra for multi-hop routes
 // ─────────────────────────────────────────────
+#define BR_GRAPH_MAX_NODES   64   // you + proxies + destination
+#define BR_GRAPH_MAX_EDGES   512
+#define BR_DIST_INF          32767
+
+// Node 0 is always "you" (the client).
+// Nodes 1..N are proxies.
+// The destination server is looked up by IP after Dijkstra.
+
+typedef struct {
+	byte     ip[4];
+	unsigned short port;       // network byte order; 0 = not a proxy
+	int      dist;             // Dijkstra distance from node 0 (you)
+	int      prev;             // previous node on shortest path
+	qbool    visited;
+} br_node_t;
+
+typedef struct {
+	int  from;
+	int  to;
+	int  dist;
+} br_edge_t;
+
+static br_node_t  br_graph_nodes[BR_GRAPH_MAX_NODES];
+static int        br_graph_node_count = 0;
+static br_edge_t  br_graph_edges[BR_GRAPH_MAX_EDGES];
+static int        br_graph_edge_count = 0;
+
+static void CL_BR_Graph_Clear(void)
+{
+	br_graph_node_count = 0;
+	br_graph_edge_count = 0;
+}
+
+// Returns existing node index or adds a new one. Port in network byte order.
+static int CL_BR_Graph_AddNode(const byte ip[4], unsigned short port)
+{
+	int i;
+	for (i = 0; i < br_graph_node_count; i++) {
+		if (memcmp(br_graph_nodes[i].ip, ip, 4) == 0)
+			return i;
+	}
+	if (br_graph_node_count >= BR_GRAPH_MAX_NODES)
+		return -1;
+	memcpy(br_graph_nodes[br_graph_node_count].ip, ip, 4);
+	br_graph_nodes[br_graph_node_count].port    = port;
+	br_graph_nodes[br_graph_node_count].dist    = BR_DIST_INF;
+	br_graph_nodes[br_graph_node_count].prev    = -1;
+	br_graph_nodes[br_graph_node_count].visited = false;
+	return br_graph_node_count++;
+}
+
+static void CL_BR_Graph_AddEdge(int from, int to, int dist)
+{
+	if (from < 0 || to < 0) return;
+	if (br_graph_edge_count >= BR_GRAPH_MAX_EDGES) return;
+	if (dist <= 0) return;
+	br_graph_edges[br_graph_edge_count].from = from;
+	br_graph_edges[br_graph_edge_count].to   = to;
+	br_graph_edges[br_graph_edge_count].dist = dist;
+	br_graph_edge_count++;
+}
+
+// Simple O(N^2) Dijkstra -- node count is small (< 64)
+static void CL_BR_Graph_Dijkstra(int start)
+{
+	int i;
+	br_graph_nodes[start].dist = 0;
+	for (;;) {
+		int cur = -1, best = BR_DIST_INF;
+		for (i = 0; i < br_graph_node_count; i++) {
+			if (!br_graph_nodes[i].visited && br_graph_nodes[i].dist < best) {
+				best = br_graph_nodes[i].dist;
+				cur  = i;
+			}
+		}
+		if (cur < 0) break;
+		br_graph_nodes[cur].visited = true;
+		for (i = 0; i < br_graph_edge_count; i++) {
+			int alt, nb;
+			if (br_graph_edges[i].from != cur) continue;
+			nb  = br_graph_edges[i].to;
+			alt = br_graph_nodes[cur].dist + br_graph_edges[i].dist;
+			if (alt < br_graph_nodes[nb].dist) {
+				br_graph_nodes[nb].dist = alt;
+				br_graph_nodes[nb].prev = cur;
+			}
+		}
+	}
+}
+
+// Build proxylist string "ip:port" or "ip1:port1@ip2:port2" from Dijkstra path
+// walking backwards from node_id to start (node 0).
+// Returns the total Dijkstra ping.
+static int CL_BR_Graph_BuildProxyString(int node_id, char *out, size_t outsz)
+{
+	char buf[BR_GRAPH_MAX_NODES][32];
+	int  hops = 0, n = br_graph_nodes[node_id].prev;
+
+	out[0] = '\0';
+	// collect proxies on path (skip node 0 = you, skip destination node)
+	while (n > 0 && hops < BR_GRAPH_MAX_NODES) {
+		snprintf(buf[hops], sizeof(buf[0]), "%d.%d.%d.%d:%d",
+		         br_graph_nodes[n].ip[0], br_graph_nodes[n].ip[1],
+		         br_graph_nodes[n].ip[2], br_graph_nodes[n].ip[3],
+		         (int)ntohs(br_graph_nodes[n].port));
+		hops++;
+		n = br_graph_nodes[n].prev;
+	}
+	// proxies were collected destination->you, reverse to you->destination
+	if (hops > 0) {
+		int h;
+		char tmp[MAX_PROXYLIST];
+		tmp[0] = '\0';
+		for (h = hops - 1; h >= 0; h--) {
+			if (tmp[0]) strlcat(tmp, "@", sizeof(tmp));
+			strlcat(tmp, buf[h], sizeof(tmp));
+		}
+		strlcpy(out, tmp, outsz);
+	}
+	return br_graph_nodes[node_id].dist;
+}
+
+
 typedef struct {
 	char    proxylist[MAX_PROXYLIST];
 	char    label[128];
@@ -98,11 +221,11 @@ static const char *CL_BR_PingColor(float ms)
 	// Safety fallbacks in case cvars are not yet initialised (value == 0)
 	if (g <= 0) g = 40;
 	if (y <= 0) y = 80;
-	if (o <= 0) o = 130;
+	if (o <= 0) o = 200;
 	if (ms <= g) return "&c0f0";   // green   <= 40ms
 	if (ms <= y) return "&cff0";   // yellow  <= 80ms
-	if (ms <= o) return "&cfa0";   // orange  <= 130ms
-	return "&cf00";                // red     >130ms -- unplayable
+	if (ms <= o) return "&cfa0";   // orange  <= 200ms
+	return "&cf00";                // red     >200ms -- unplayable
 }
 
 static const char *CL_BR_LossColor(float pct)
@@ -307,7 +430,7 @@ cleanup:
 // --------------------------------------------
 static float CL_BR_Score(float ping_ms, float loss_pct, qbool via_proxy)
 {
-	float o        = cl_connectbr_ping_orange.value  > 0 ? cl_connectbr_ping_orange.value  : 130.0f;
+	float o        = cl_connectbr_ping_orange.value  > 0 ? cl_connectbr_ping_orange.value  : 200.0f;
 	float w_ping   = cl_connectbr_weight_ping.value  > 0 ? cl_connectbr_weight_ping.value  : 0.6f;
 	float w_loss   = cl_connectbr_weight_loss.value  > 0 ? cl_connectbr_weight_loss.value  : 0.4f;
 	float ping_ref = o * 2.0f;  // 260ms as full scale
@@ -346,152 +469,268 @@ static void CL_BR_GetFirstHop(const char *proxylist, char *out, size_t outsz)
 }
 
 // ─────────────────────────────────────────────
-// Query a qwfwd proxy for its ping to a specific destination.
-// Uses the same "pingstatus" packet that the ping tree uses.
-// Returns the proxy's reported ping to dest_addr, or -1 if not found.
+// Query a proxy for its full pingstatus list.
+// For each entry calls the callback with (ip, port_net, ping_ms).
 // ─────────────────────────────────────────────
-static int CL_BR_GetProxyPingToServer(const netadr_t *proxy_addr,
-                                       const netadr_t *dest_addr)
+typedef void (*br_pingstatus_cb)(const byte ip[4], unsigned short port_net,
+                                  int ping_ms, void *userdata);
+
+static void CL_BR_QueryPingStatus(const netadr_t *proxy_addr,
+                                   br_pingstatus_cb cb, void *userdata)
 {
-	byte buf[8 * MAX_SERVERS];  // 8 bytes per entry: 4 ip + 2 port + 2 ping
-	char packet[] = "\xff\xff\xff\xffpingstatus";
-	struct sockaddr_storage addr_to;
-	struct sockaddr_storage addr_from;
-	socklen_t addr_from_len;
-	struct timeval timeout;
+	char packet[]    = "\xff\xff\xff\xffpingstatus";
+	byte buf[8 * 512];
+	struct sockaddr_storage addr_to, addr_from;
+	socklen_t from_len;
+	struct timeval tv;
 	fd_set fd;
 	socket_t sock;
-	int ret, result = -1;
-	int timeout_ms;
+	int ret, timeout_ms;
 
 	sock = UDP_OpenSocket(PORT_ANY);
-	if (sock == INVALID_SOCKET)
-		return -1;
+	if (sock == INVALID_SOCKET) return;
 
 	NetadrToSockadr(proxy_addr, &addr_to);
-
 	ret = sendto(sock, packet, strlen(packet), 0,
 	             (struct sockaddr *)&addr_to, sizeof(struct sockaddr));
-	if (ret < 0) goto done;
+	if (ret < 0) { closesocket(sock); return; }
 
 	timeout_ms = (int)cl_connectbr_timeout_ms.value;
 	if (timeout_ms <= 0) timeout_ms = 600;
 
 	FD_ZERO(&fd);
 	FD_SET(sock, &fd);
-	timeout.tv_sec  = timeout_ms / 1000;
-	timeout.tv_usec = (timeout_ms % 1000) * 1000;
+	tv.tv_sec  = timeout_ms / 1000;
+	tv.tv_usec = (timeout_ms % 1000) * 1000;
 
-	ret = select(sock + 1, &fd, NULL, NULL, &timeout);
-	if (ret <= 0) goto done;
-
-	addr_from_len = sizeof(addr_from);
-	ret = recvfrom(sock, (char *)buf, sizeof(buf), 0,
-	               (struct sockaddr *)&addr_from, &addr_from_len);
-	if (ret < 5) goto done;
-
-	// reply starts with "\xff\xff\xff\xffn"
-	if (memcmp(buf, "\xff\xff\xff\xffn", 5) != 0) goto done;
-
-	// parse entries: 4 bytes ip, 2 bytes port, 2 bytes ping
-	{
-		const byte *p = buf + 5;
-		const byte *end = buf + ret;
-		while (p + 8 <= end) {
-			short dist;
-			if (memcmp(p, dest_addr->ip, 4) == 0) {
-				// port at p+4, ping at p+6
-				memcpy(&dist, p + 6, 2);
-				dist = (short)LittleShort(dist);
-				if (dist >= 0)
-					result = (int)dist;
-				break;
+	ret = select(sock + 1, &fd, NULL, NULL, &tv);
+	if (ret > 0) {
+		from_len = sizeof(addr_from);
+		ret = recvfrom(sock, (char *)buf, sizeof(buf), 0,
+		               (struct sockaddr *)&addr_from, &from_len);
+		if (ret > 5 && memcmp(buf, "\xff\xff\xff\xffn", 5) == 0) {
+			const byte *p   = buf + 5;
+			const byte *end = buf + ret;
+			while (p + 8 <= end) {
+				unsigned short port_net, ping_raw;
+				memcpy(&port_net, p + 4, 2);
+				memcpy(&ping_raw, p + 6, 2);
+				if ((short)LittleShort(ping_raw) >= 0)
+					cb(p, port_net, (int)(short)LittleShort(ping_raw), userdata);
+				p += 8;
 			}
-			p += 8;
 		}
 	}
-
-done:
 	closesocket(sock);
-	return result;
+}
+
+// callback: adds proxy->neighbour edge into the graph
+typedef struct { int proxy_node; } br_edge_cb_data_t;
+
+static void CL_BR_EdgeCallback(const byte ip[4], unsigned short port_net,
+                                int ping_ms, void *userdata)
+{
+	br_edge_cb_data_t *d = (br_edge_cb_data_t *)userdata;
+	static const byte zero[4] = {0,0,0,0};
+	int nb;
+	if (memcmp(ip, zero, 4) == 0) return;
+	nb = CL_BR_Graph_AddNode(ip, port_net);
+	CL_BR_Graph_AddEdge(d->proxy_node, nb, ping_ms);
 }
 
 // ─────────────────────────────────────────────
-// Measure full chain ping: you->proxy->destination
-//
-// For proxy routes:
-//   1. Get you->proxy ping (browser or A2A_PING)
-//   2. Query the proxy directly for its ping to the destination
-//      using the qwfwd "pingstatus" packet (same protocol the ping tree uses)
-//   3. total = you->proxy + proxy->dest
-//
-// For direct routes: browser ping preferred, A2A_PING as last resort.
+// Build multi-hop graph, run Dijkstra, extract all routes.
 // ─────────────────────────────────────────────
-static qbool CL_BR_MeasureCandidate(const char *proxylist, qbool via_proxy,
-                                     float *out_ping, float *out_loss)
+static void CL_BR_BuildGraphRoutes(void)
 {
-	if (!out_ping || !out_loss) return false;
+	int i, j;
+	static const byte zero_ip[4] = {0,0,0,0};
+	int start, dest_node;
 
-	if (proxylist && proxylist[0]) {
-		char first_hop[64];
-		netadr_t hop_addr;
-		float proxy_ping, proxy_loss;
+	CL_BR_Graph_Clear();
 
-		CL_BR_GetFirstHop(proxylist, first_hop, sizeof(first_hop));
+	// Node 0 = you
+	start = CL_BR_Graph_AddNode(zero_ip, 0);
+	br_graph_nodes[start].dist = 0;
 
-		// Try cache first (cache stores already-computed total ping)
-		if (CL_BR_GetCached(first_hop, out_ping, out_loss))
-			return true;
+	// Collect proxies from browser
+	{
+		int proxy_count = 0;
+		netadr_t proxy_addrs[CONNECTBR_MAX_PROXIES];
+		char     proxy_labels[CONNECTBR_MAX_PROXIES][64];
 
-		NET_StringToAdr(first_hop, &hop_addr);
+		SB_ServerList_Lock();
+		for (i = 0; i < serversn && proxy_count < CONNECTBR_MAX_PROXIES; i++) {
+			server_data *s = servers[i];
+			qbool dup = false;
+			if (!s || !s->qwfwd || s->ping < 0) continue;
+			if (memcmp(s->address.ip, br_target_addr.ip, 4) == 0) continue;
+			for (j = 0; j < proxy_count && !dup; j++)
+				if (memcmp(proxy_addrs[j].ip, s->address.ip, 4) == 0 &&
+				    proxy_addrs[j].port == s->address.port) dup = true;
+			if (dup) continue;
+			proxy_addrs[proxy_count] = s->address;
+			snprintf(proxy_labels[proxy_count], sizeof(proxy_labels[0]),
+			         "%s", s->display.name[0] ? s->display.name : "proxy");
+			proxy_count++;
+		}
+		SB_ServerList_Unlock();
 
-		// Step 1: measure you -> proxy
-		{
-			int bp = CL_BR_GetBrowserPing(&hop_addr);
-			if (bp >= 0) {
-				proxy_ping = (float)bp;
-				proxy_loss = 0;
-			} else if (CL_BR_MeasureHop(&hop_addr, &proxy_ping, &proxy_loss)) {
-				// measured via A2A_PING
-			} else {
-				return false;  // proxy unreachable
+		// Hardcoded fallback if browser empty
+		if (proxy_count == 0) {
+			int k;
+			for (k = 0; br_known_proxies[k] && proxy_count < CONNECTBR_MAX_PROXIES; k++) {
+				netadr_t a;
+				qbool dup = false;
+				if (!NET_StringToAdr(br_known_proxies[k], &a)) continue;
+				if (memcmp(a.ip, br_target_addr.ip, 4) == 0) continue;
+				for (j = 0; j < proxy_count && !dup; j++)
+					if (memcmp(proxy_addrs[j].ip, a.ip, 4) == 0) dup = true;
+				if (dup) continue;
+				proxy_addrs[proxy_count] = a;
+				strlcpy(proxy_labels[proxy_count], br_known_proxies[k],
+				        sizeof(proxy_labels[0]));
+				proxy_count++;
 			}
 		}
 
-		// Step 2: query proxy for its ping to the destination server
-		{
-			int proxy_to_dest = CL_BR_GetProxyPingToServer(&hop_addr, &br_target_addr);
+		// Add proxy nodes + you->proxy edges
+		for (i = 0; i < proxy_count; i++) {
+			int node_id, ping_you_proxy = -1;
+			float fping, floss;
 
-			if (proxy_to_dest >= 0) {
-				// accurate: proxy reported its actual ping to the destination
-				*out_ping = proxy_ping + (float)proxy_to_dest;
-			} else {
-				// proxy didn't report dest in its list — fall back to browser direct ping
-				int dest_direct = CL_BR_GetBrowserPing(&br_target_addr);
-				if (dest_direct > 0) {
-					float dest_hop = (float)dest_direct - proxy_ping;
-					if (dest_hop < 1.0f) dest_hop = 1.0f;
-					*out_ping = proxy_ping + dest_hop;
-				} else {
-					// last resort: assume proxy->dest ~ proxy_ping (symmetric estimate)
-					*out_ping = proxy_ping * 2.0f;
-				}
+			ping_you_proxy = CL_BR_GetBrowserPing(&proxy_addrs[i]);
+			if (ping_you_proxy < 0 && CL_BR_MeasureHop(&proxy_addrs[i], &fping, &floss))
+				ping_you_proxy = (int)fping;
+			if (ping_you_proxy <= 0) {
+				Com_Printf("  [%s]... &cf00unreachable&r\n", proxy_labels[i]);
+				continue;
 			}
-			*out_loss = proxy_loss;
-		}
 
-		CL_BR_StoreCached(first_hop, *out_ping, *out_loss);
-		return true;
+			node_id = CL_BR_Graph_AddNode(proxy_addrs[i].ip, proxy_addrs[i].port);
+			CL_BR_Graph_AddEdge(start, node_id, ping_you_proxy);
 
-	} else {
-		// Direct: browser ping preferred, A2A_PING as last resort
-		int bp = CL_BR_GetBrowserPing(&br_target_addr);
-		if (bp >= 0) {
-			*out_ping = (float)bp;
-			*out_loss = 0;
-			return true;
+			Com_Printf("  [%s]... ping=%s%dms&r\n",
+			           proxy_labels[i],
+			           CL_BR_PingColor((float)ping_you_proxy), ping_you_proxy);
 		}
-		return CL_BR_MeasureHop(&br_target_addr, out_ping, out_loss);
+	}
+
+	// Add destination node + direct edge
+	dest_node = CL_BR_Graph_AddNode(br_target_addr.ip, br_target_addr.port);
+	{
+		int dp = CL_BR_GetBrowserPing(&br_target_addr);
+		if (dp < 0) {
+			float fping, floss;
+			if (CL_BR_MeasureHop(&br_target_addr, &fping, &floss))
+				dp = (int)fping;
+		}
+		if (dp > 0) {
+			CL_BR_Graph_AddEdge(start, dest_node, dp);
+			Com_Printf("  [direct]... ping=%s%dms&r\n",
+			           CL_BR_PingColor((float)dp), dp);
+		} else {
+			Com_Printf("  [direct]... &cf00unreachable&r\n");
+		}
+	}
+
+	// Query each proxy for pingstatus -- builds proxy->* edges (multi-hop)
+	for (i = 1; i < br_graph_node_count; i++) {
+		br_edge_cb_data_t d;
+		netadr_t padr;
+		if (br_graph_nodes[i].port == 0) continue;
+		if (i == dest_node) continue;
+		d.proxy_node = i;
+		padr.type = NA_IP;
+		memcpy(padr.ip, br_graph_nodes[i].ip, 4);
+		padr.port = br_graph_nodes[i].port;
+		CL_BR_QueryPingStatus(&padr, CL_BR_EdgeCallback, &d);
+	}
+
+	// Run Dijkstra
+	CL_BR_Graph_Dijkstra(start);
+}
+
+static void CL_BR_ExtractGraphRoutes(void)
+{
+	int dest_node = -1, i, j;
+	char proxystr[MAX_PROXYLIST];
+	int  total_ping;
+
+	for (i = 0; i < br_graph_node_count; i++) {
+		if (memcmp(br_graph_nodes[i].ip, br_target_addr.ip, 4) == 0) {
+			dest_node = i; break;
+		}
+	}
+	if (dest_node < 0 || br_graph_nodes[dest_node].dist >= BR_DIST_INF) return;
+
+	// Best route from Dijkstra
+	if (br_route_count < CONNECTBR_MAX_ROUTES) {
+		int hops = 0;
+		const char *p;
+		total_ping = CL_BR_Graph_BuildProxyString(dest_node, proxystr, sizeof(proxystr));
+		if (proxystr[0]) {
+			hops = 1;
+			p = proxystr;
+			while ((p = strchr(p, '@')) != NULL) { hops++; p++; }
+			snprintf(br_routes[br_route_count].label, sizeof(br_routes[0].label),
+			         "best route (%d hop%s)", hops, hops > 1 ? "s" : "");
+		} else {
+			strlcpy(br_routes[br_route_count].label, "direct connection",
+			        sizeof(br_routes[0].label));
+		}
+		strlcpy(br_routes[br_route_count].proxylist, proxystr, sizeof(br_routes[0].proxylist));
+		br_routes[br_route_count].ping_ms   = (float)total_ping;
+		br_routes[br_route_count].loss_pct  = 0;
+		br_routes[br_route_count].score     = CL_BR_Score((float)total_ping, 0, proxystr[0] != '\0');
+		br_routes[br_route_count].via_proxy = (proxystr[0] != '\0');
+		br_routes[br_route_count].valid     = true;
+		br_route_count++;
+	}
+
+	// Add each single-hop proxy as alternative for connectnext
+	for (i = 1; i < br_graph_node_count && br_route_count < CONNECTBR_MAX_ROUTES - 1; i++) {
+		char single[64];
+		int  single_total = -1, proxy_to_dest = -1;
+		qbool already = false;
+
+		if (br_graph_nodes[i].port == 0) continue;
+		if (i == dest_node) continue;
+		if (br_graph_nodes[i].dist >= BR_DIST_INF) continue;
+
+		// Need you->proxy edge
+		for (j = 0; j < br_graph_edge_count; j++)
+			if (br_graph_edges[j].from == 0 && br_graph_edges[j].to == i) {
+				single_total = br_graph_edges[j].dist; break;
+			}
+		if (single_total < 0) continue;
+
+		// Need proxy->dest edge
+		for (j = 0; j < br_graph_edge_count; j++)
+			if (br_graph_edges[j].from == i && br_graph_edges[j].to == dest_node) {
+				proxy_to_dest = br_graph_edges[j].dist; break;
+			}
+		if (proxy_to_dest < 0) continue;
+		single_total += proxy_to_dest;
+
+		snprintf(single, sizeof(single), "%d.%d.%d.%d:%d",
+		         br_graph_nodes[i].ip[0], br_graph_nodes[i].ip[1],
+		         br_graph_nodes[i].ip[2], br_graph_nodes[i].ip[3],
+		         (int)ntohs(br_graph_nodes[i].port));
+
+		for (j = 0; j < br_route_count; j++)
+			if (strcmp(br_routes[j].proxylist, single) == 0) { already = true; break; }
+		if (already) continue;
+
+		snprintf(br_routes[br_route_count].label, sizeof(br_routes[0].label),
+		         "via proxy %s", single);
+		strlcpy(br_routes[br_route_count].proxylist, single, sizeof(br_routes[0].proxylist));
+		br_routes[br_route_count].ping_ms   = (float)single_total;
+		br_routes[br_route_count].loss_pct  = 0;
+		br_routes[br_route_count].score     = CL_BR_Score((float)single_total, 0, true);
+		br_routes[br_route_count].via_proxy = true;
+		br_routes[br_route_count].valid     = true;
+		br_route_count++;
 	}
 }
 
@@ -601,164 +840,45 @@ void CL_Connect_BestRoute_f(void)
 		Com_Printf("\n");
 	}
 
-	// ── Ping tree best proxy path (only if ping tree was built) ───────
-	// SB_PingTree_GetProxyString returns the Dijkstra total cost in
-	// out_total_ping_ms which already accounts for the full chain:
-	// you -> proxy -> ... -> server.  We use that directly instead of
-	// re-measuring only the first hop.
-	if (SB_PingTree_Built() && br_route_count < CONNECTBR_MAX_ROUTES - 1) {
+	// ── Build multi-hop graph + Dijkstra ─────────────────────────────
+	// This queries every known proxy with "pingstatus" to discover
+	// proxy->proxy and proxy->server pings, then runs Dijkstra to find
+	// the true best route including multi-hop chains.
+	// If the ping tree is already built, its result is added first as
+	// an authoritative cross-check.
+	Com_Printf("  Building route graph...\n");
+	CL_BR_BuildGraphRoutes();
+	CL_BR_ExtractGraphRoutes();
+
+	// If ping tree is available, add its best route too (deduped)
+	if (SB_PingTree_Built()) {
 		int pathlen = SB_PingTree_GetPathLen(&br_target_addr);
-		if (pathlen > 0) {
+		if (pathlen > 0 && br_route_count < CONNECTBR_MAX_ROUTES) {
 			int  total_ping_ms = 0;
 			char proxy_str[MAX_PROXYLIST];
-
 			if (SB_PingTree_GetProxyString(&br_target_addr, proxy_str,
 			                               sizeof(proxy_str), &total_ping_ms)
 			    && total_ping_ms > 0) {
-				float ping = (float)total_ping_ms;
-				float loss = 0;
-
-				Com_Printf("  [ping tree best (%d hop%s)]... ", pathlen, pathlen > 1 ? "s" : "");
-				Com_Printf("ping=%s%.0fms&r  loss=%s%.0f%%&r\n",
-				           CL_BR_PingColor(ping), ping,
-				           CL_BR_LossColor(loss), loss);
-
-				strlcpy(br_routes[br_route_count].proxylist, proxy_str,
-				        sizeof(br_routes[0].proxylist));
-				snprintf(br_routes[br_route_count].label,
-				         sizeof(br_routes[0].label),
-				         "ping tree best (%d hop%s)",
-				         pathlen, pathlen > 1 ? "s" : "");
-				br_routes[br_route_count].ping_ms   = ping;
-				br_routes[br_route_count].loss_pct  = loss;
-				br_routes[br_route_count].score     = CL_BR_Score(ping, loss, true);
-				br_routes[br_route_count].via_proxy = true;
-				br_routes[br_route_count].valid     = true;
-				br_route_count++;
-			}
-		}
-	}
-
-	// ── Individual proxies from server browser ────────────────────────
-	// Collect all qwfwd proxies while holding the lock, then measure
-	// them without holding the lock (network I/O must not hold the lock).
-	// Skip proxies whose IP matches the target server (pointless hop).
-	{
-		char proxy_ips  [CONNECTBR_MAX_PROXIES][64];
-		char proxy_names[CONNECTBR_MAX_PROXIES][128];
-		int  proxy_count = 0;
-
-		SB_ServerList_Lock();
-		for (i = 0; i < serversn && proxy_count < CONNECTBR_MAX_PROXIES; i++) {
-			server_data *s = servers[i];
-			char proxy_ip[64];
-			int j;
-			qbool dup = false;
-
-			if (!s) continue;                // NULL guard
-			if (!s->qwfwd) continue;
-			if (s->ping < 0) continue;
-
-			// Skip proxy if same IP as target server
-			if (memcmp(s->address.ip, br_target_addr.ip, 4) == 0)
-				continue;
-
-			snprintf(proxy_ip, sizeof(proxy_ip), "%d.%d.%d.%d:%d",
-			         s->address.ip[0], s->address.ip[1],
-			         s->address.ip[2], s->address.ip[3],
-			         ntohs(s->address.port));
-
-			// Skip duplicates already in br_routes (ping tree)
-			for (j = 0; j < br_route_count && !dup; j++)
-				if (strcmp(br_routes[j].proxylist, proxy_ip) == 0) dup = true;
-
-			// Skip duplicates in temp list
-			for (j = 0; j < proxy_count && !dup; j++)
-				if (strcmp(proxy_ips[j], proxy_ip) == 0) dup = true;
-
-			if (dup) continue;
-
-			strlcpy(proxy_ips  [proxy_count], proxy_ip,   sizeof(proxy_ips[0]));
-			strlcpy(proxy_names[proxy_count],
-			        s->display.name[0] ? s->display.name : proxy_ip,
-			        sizeof(proxy_names[0]));
-			proxy_count++;
-		}
-		SB_ServerList_Unlock();
-
-		// If browser returned no proxies, fall back to hardcoded known proxies
-		if (proxy_count == 0) {
-			int k;
-			for (k = 0; br_known_proxies[k] && proxy_count < CONNECTBR_MAX_PROXIES; k++) {
-				netadr_t kaddr;
-				int j;
 				qbool dup = false;
-
-				if (!NET_StringToAdr(br_known_proxies[k], &kaddr)) continue;
-
-				// Skip if same IP as target
-				if (memcmp(kaddr.ip, br_target_addr.ip, 4) == 0) continue;
-
-				// Skip duplicates already in br_routes
-				for (j = 0; j < br_route_count && !dup; j++)
-					if (strcmp(br_routes[j].proxylist, br_known_proxies[k]) == 0) dup = true;
-				for (j = 0; j < proxy_count && !dup; j++)
-					if (strcmp(proxy_ips[j], br_known_proxies[k]) == 0) dup = true;
-
-				if (dup) continue;
-
-				strlcpy(proxy_ips  [proxy_count], br_known_proxies[k], sizeof(proxy_ips[0]));
-				strlcpy(proxy_names[proxy_count], br_known_proxies[k], sizeof(proxy_names[0]));
-				proxy_count++;
+				int r;
+				for (r = 0; r < br_route_count; r++)
+					if (strcmp(br_routes[r].proxylist, proxy_str) == 0) { dup = true; break; }
+				if (!dup) {
+					float ping = (float)total_ping_ms;
+					snprintf(br_routes[br_route_count].label,
+					         sizeof(br_routes[0].label),
+					         "ping tree best (%d hop%s)",
+					         pathlen, pathlen > 1 ? "s" : "");
+					strlcpy(br_routes[br_route_count].proxylist, proxy_str,
+					        sizeof(br_routes[0].proxylist));
+					br_routes[br_route_count].ping_ms   = ping;
+					br_routes[br_route_count].loss_pct  = 0;
+					br_routes[br_route_count].score     = CL_BR_Score(ping, 0, true);
+					br_routes[br_route_count].via_proxy = true;
+					br_routes[br_route_count].valid     = true;
+					br_route_count++;
+				}
 			}
-		}
-
-		// Measure each collected proxy
-		// Reserve 1 slot for direct connection, hence CONNECTBR_MAX_ROUTES - 1
-		for (i = 0; i < proxy_count && br_route_count < CONNECTBR_MAX_ROUTES - 1; i++) {
-			float ping, loss;
-			Com_Printf("  [%s]... ", proxy_names[i]);
-
-			if (CL_BR_MeasureCandidate(proxy_ips[i], true, &ping, &loss)) {
-				Com_Printf("ping=%s%.0fms&r  loss=%s%.0f%%&r\n",
-				           CL_BR_PingColor(ping), ping,
-				           CL_BR_LossColor(loss), loss);
-				strlcpy(br_routes[br_route_count].proxylist, proxy_ips[i],
-				        sizeof(br_routes[0].proxylist));
-				snprintf(br_routes[br_route_count].label,
-				         sizeof(br_routes[0].label),
-				         "via proxy %s", proxy_names[i]);
-				br_routes[br_route_count].ping_ms   = ping;
-				br_routes[br_route_count].loss_pct  = loss;
-				br_routes[br_route_count].score     = CL_BR_Score(ping, loss, true);
-				br_routes[br_route_count].via_proxy = true;
-				br_routes[br_route_count].valid     = true;
-				br_route_count++;
-			} else {
-				Com_Printf("&cf00unreachable&r\n");
-			}
-		}
-	}
-
-	// ── Direct connection ─────────────────────────────────────────────
-	if (br_route_count < CONNECTBR_MAX_ROUTES) {
-		float ping, loss;
-		Com_Printf("  [direct]... ");
-		if (CL_BR_MeasureCandidate("", false, &ping, &loss)) {
-			Com_Printf("ping=%s%.0fms&r  loss=%s%.0f%%&r\n",
-			           CL_BR_PingColor(ping), ping,
-			           CL_BR_LossColor(loss), loss);
-			br_routes[br_route_count].proxylist[0] = '\0';
-			strlcpy(br_routes[br_route_count].label, "direct connection",
-			        sizeof(br_routes[0].label));
-			br_routes[br_route_count].ping_ms   = ping;
-			br_routes[br_route_count].loss_pct  = loss;
-			br_routes[br_route_count].score     = CL_BR_Score(ping, loss, false);
-			br_routes[br_route_count].via_proxy = false;
-			br_routes[br_route_count].valid     = true;
-			br_route_count++;
-		} else {
-			Com_Printf("&cf00unreachable&r\n");
 		}
 	}
 
@@ -776,7 +896,7 @@ void CL_Connect_BestRoute_f(void)
 	{
 		int max_ping = (int)cl_connectbr_ping_orange.value;
 		int usable   = 0;
-		if (max_ping <= 0) max_ping = 130;
+		if (max_ping <= 0) max_ping = 200;
 		for (i = 0; i < br_route_count; i++) {
 			if (br_routes[i].ping_ms <= max_ping) {
 				if (i != usable)
@@ -793,7 +913,7 @@ void CL_Connect_BestRoute_f(void)
 
 	if (br_route_count == 0) {
 		Com_Printf("\nconnectbr: all routes have ping above %dms -- unplayable.\n",
-		           (int)cl_connectbr_ping_orange.value > 0 ? (int)cl_connectbr_ping_orange.value : 130);
+		           (int)cl_connectbr_ping_orange.value > 0 ? (int)cl_connectbr_ping_orange.value : 200);
 		br_active = false;
 		return;
 	}
