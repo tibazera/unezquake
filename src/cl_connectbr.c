@@ -30,9 +30,9 @@ CVars:
 cvar_t cl_connectbr_test_packets  = {"cl_connectbr_test_packets",  "25",   CVAR_ARCHIVE};
 cvar_t cl_connectbr_timeout_ms    = {"cl_connectbr_timeout_ms",    "600",  CVAR_ARCHIVE};
 cvar_t cl_connectbr_packet_delay  = {"cl_connectbr_packet_delay",  "15",   CVAR_ARCHIVE};
-cvar_t cl_connectbr_ping_green    = {"cl_connectbr_ping_green",    "40",   CVAR_ARCHIVE};  // <= 40ms verde
-cvar_t cl_connectbr_ping_yellow   = {"cl_connectbr_ping_yellow",   "80",   CVAR_ARCHIVE};  // <= 80ms amarelo
-cvar_t cl_connectbr_ping_orange   = {"cl_connectbr_ping_orange",   "130",  CVAR_ARCHIVE};  // <= 130ms laranja, >130 vermelho (inutilizavel)
+cvar_t cl_connectbr_ping_green    = {"cl_connectbr_ping_green",    "40",   CVAR_ARCHIVE};  // <= 40ms green
+cvar_t cl_connectbr_ping_yellow   = {"cl_connectbr_ping_yellow",   "80",   CVAR_ARCHIVE};  // <= 80ms yellow
+cvar_t cl_connectbr_ping_orange   = {"cl_connectbr_ping_orange",   "130",  CVAR_ARCHIVE};  // <= 130ms orange, >130 red (unplayable)
 cvar_t cl_connectbr_weight_ping   = {"cl_connectbr_weight_ping",   "0.6",  CVAR_ARCHIVE};
 cvar_t cl_connectbr_weight_loss   = {"cl_connectbr_weight_loss",   "0.4",  CVAR_ARCHIVE};
 cvar_t cl_connectbr_verbose       = {"cl_connectbr_verbose",       "1",    CVAR_ARCHIVE};
@@ -92,20 +92,24 @@ static int                  proxy_cache_count = 0;
 // ─────────────────────────────────────────────
 static const char *CL_BR_PingColor(float ms)
 {
-	int g = (int)cl_connectbr_ping_green.value;   // <= 40 verde
-	int y = (int)cl_connectbr_ping_yellow.value;  // <= 80 amarelo
-	int o = (int)cl_connectbr_ping_orange.value;  // <= 130 laranja, >130 vermelho
-	if (ms <= g) return "&c0f0";   // verde
-	if (ms <= y) return "&cff0";   // amarelo
-	if (ms <= o) return "&cfa0";   // laranja
-	return "&cf00";                // vermelho — inutilizavel
+	int g = (int)cl_connectbr_ping_green.value;
+	int y = (int)cl_connectbr_ping_yellow.value;
+	int o = (int)cl_connectbr_ping_orange.value;
+	// Safety fallbacks in case cvars are not yet initialised (value == 0)
+	if (g <= 0) g = 40;
+	if (y <= 0) y = 80;
+	if (o <= 0) o = 130;
+	if (ms <= g) return "&c0f0";   // green   <= 40ms
+	if (ms <= y) return "&cff0";   // yellow  <= 80ms
+	if (ms <= o) return "&cfa0";   // orange  <= 130ms
+	return "&cf00";                // red     >130ms -- unplayable
 }
 
 static const char *CL_BR_LossColor(float pct)
 {
-	if (pct == 0)  return "&c0f0";
-	if (pct <= 5)  return "&cfa0";
-	return "&cf00";
+	if (pct <= 0) return "&c0f0";  // green  -- 0% loss
+	if (pct <= 5) return "&cff0";  // yellow -- up to 5%
+	return "&cf00";                // red    -- >5% unacceptable
 }
 
 // ─────────────────────────────────────────────
@@ -289,21 +293,22 @@ cleanup:
 	return success;
 }
 
-// ─────────────────────────────────────────────
-// Score — lower is better.
-// Usa ping absoluto com escala unica (130ms = threshold de orange)
-// para garantir que direto 11ms sempre supera proxy 193ms.
-// A escala dupla anterior (proxy 160ms vs direto 80ms) causava o bug
-// onde um proxy com 193ms era escolhido antes de conexao direta com 11ms.
-// ─────────────────────────────────────────────
+// --------------------------------------------
+// Score -- lower is better.
+// Single absolute scale so direct 11ms always beats proxy 193ms.
+// The old dual-scale (proxy ref 160ms vs direct ref 80ms) was the
+// root cause of wrong route selection.
+// Uses hardcoded fallbacks in case cvars are not yet initialised (value==0).
+// --------------------------------------------
 static float CL_BR_Score(float ping_ms, float loss_pct, qbool via_proxy)
 {
-	float ping_ref  = (float)cl_connectbr_ping_orange.value * 2.0f;  // escala unica: 260ms
+	float o        = cl_connectbr_ping_orange.value  > 0 ? cl_connectbr_ping_orange.value  : 130.0f;
+	float w_ping   = cl_connectbr_weight_ping.value  > 0 ? cl_connectbr_weight_ping.value  : 0.6f;
+	float w_loss   = cl_connectbr_weight_loss.value  > 0 ? cl_connectbr_weight_loss.value  : 0.4f;
+	float ping_ref = o * 2.0f;  // 260ms as full scale
 	float norm_ping = ping_ms  / ping_ref;
 	float norm_loss = loss_pct / 100.0f;
-	float w_ping    = cl_connectbr_weight_ping.value;
-	float w_loss    = cl_connectbr_weight_loss.value;
-	(void)via_proxy;  // sem penalidade/bonus por tipo de rota
+	(void)via_proxy;  // no bonus/penalty by route type -- pure ping wins
 	return w_ping * norm_ping + w_loss * norm_loss;
 }
 
@@ -399,7 +404,7 @@ static void CL_BR_ApplyRoute(int idx)
 	if (r->proxylist[0])
 		Cvar_Set(&cl_proxyaddr, r->proxylist);
 
-	Com_Printf("\n&cf80connectbr:&r route #%d — %s\n", idx + 1, r->label);
+	Com_Printf("\n&cf80connectbr:&r route #%d - %s\n", idx + 1, r->label);
 	Com_Printf("  ping: %s%.0fms&r  loss: %s%.0f%%&r\n",
 	           CL_BR_PingColor(r->ping_ms), r->ping_ms,
 	           CL_BR_LossColor(r->loss_pct), r->loss_pct);
@@ -455,7 +460,7 @@ void CL_Connect_BestRoute_f(void)
 		br_target_addr.port = htons(27500);
 
 	if (SB_PingTree_IsBuilding()) {
-		Com_Printf("connectbr: ping tree still building — please wait and retry.\n");
+		Com_Printf("connectbr: ping tree still building -- please wait and retry.\n");
 		return;
 	}
 
@@ -572,7 +577,7 @@ void CL_Connect_BestRoute_f(void)
 		SB_ServerList_Unlock();
 
 		// Measure each collected proxy
-		for (i = 0; i < proxy_count && br_route_count < CONNECTBR_MAX_ROUTES - 1; i++) {
+		for (i = 0; i < proxy_count && br_route_count < CONNECTBR_MAX_ROUTES; i++) {
 			float ping, loss;
 			Com_Printf("  [%s]... ", proxy_names[i]);
 
@@ -626,13 +631,14 @@ void CL_Connect_BestRoute_f(void)
 		return;
 	}
 
-	// Sort by score (ping absoluto, menor primeiro)
+	// Sort by score (absolute ping, lowest first)
 	qsort(br_routes, br_route_count, sizeof(route_t), CL_BR_RouteCompare);
 
-	// Filtrar rotas com ping > cl_connectbr_ping_orange (inutilizaveis)
+	// Filter out routes with ping > orange threshold (unplayable)
 	{
 		int max_ping = (int)cl_connectbr_ping_orange.value;
 		int usable   = 0;
+		if (max_ping <= 0) max_ping = 130;  // safety: never filter everything if cvar is 0
 		for (i = 0; i < br_route_count; i++) {
 			if (br_routes[i].ping_ms <= max_ping) {
 				if (i != usable)
@@ -641,20 +647,20 @@ void CL_Connect_BestRoute_f(void)
 			}
 		}
 		if (usable < br_route_count) {
-			Com_Printf("  (%d rota(s) com ping >%dms removida(s) — inutilizaveis)\n",
+			Com_Printf("  (%d route(s) with ping >%dms removed -- unplayable)\n",
 			           br_route_count - usable, max_ping);
 			br_route_count = usable;
 		}
 	}
 
 	if (br_route_count == 0) {
-		Com_Printf("\nconnectbr: todas as rotas tem ping acima de %dms — inutilizaveis.\n",
-		           (int)cl_connectbr_ping_orange.value);
+		Com_Printf("\nconnectbr: all routes have ping above %dms -- unplayable.\n",
+		           (int)cl_connectbr_ping_orange.value > 0 ? (int)cl_connectbr_ping_orange.value : 130);
 		br_active = false;
 		return;
 	}
 
-	// Mostrar ranking: apenas rotas utilizaveis, do menor para o maior ping
+	// Show ranking: usable routes only, lowest ping first
 	Com_Printf("\n&cf80--- route ranking ---&r\n");
 	for (i = 0; i < br_route_count; i++) {
 		Com_Printf("  #%d %s\n     ping=%s%.0fms&r  loss=%s%.0f%%&r\n",
