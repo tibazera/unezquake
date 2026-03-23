@@ -346,8 +346,86 @@ static void CL_BR_GetFirstHop(const char *proxylist, char *out, size_t outsz)
 }
 
 // ─────────────────────────────────────────────
-// Measure a candidate — browser ping preferred,
-// A2A_PING as fallback, cache for both.
+// Query a qwfwd proxy for its ping to a specific destination.
+// Uses the same "pingstatus" packet that the ping tree uses.
+// Returns the proxy's reported ping to dest_addr, or -1 if not found.
+// ─────────────────────────────────────────────
+static int CL_BR_GetProxyPingToServer(const netadr_t *proxy_addr,
+                                       const netadr_t *dest_addr)
+{
+	byte buf[8 * MAX_SERVERS];  // 8 bytes per entry: 4 ip + 2 port + 2 ping
+	char packet[] = "\xff\xff\xff\xffpingstatus";
+	struct sockaddr_storage addr_to;
+	struct sockaddr_storage addr_from;
+	socklen_t addr_from_len;
+	struct timeval timeout;
+	fd_set fd;
+	socket_t sock;
+	int ret, result = -1;
+	int timeout_ms;
+
+	sock = UDP_OpenSocket(PORT_ANY);
+	if (sock == INVALID_SOCKET)
+		return -1;
+
+	NetadrToSockadr(proxy_addr, &addr_to);
+
+	ret = sendto(sock, packet, strlen(packet), 0,
+	             (struct sockaddr *)&addr_to, sizeof(struct sockaddr));
+	if (ret < 0) goto done;
+
+	timeout_ms = (int)cl_connectbr_timeout_ms.value;
+	if (timeout_ms <= 0) timeout_ms = 600;
+
+	FD_ZERO(&fd);
+	FD_SET(sock, &fd);
+	timeout.tv_sec  = timeout_ms / 1000;
+	timeout.tv_usec = (timeout_ms % 1000) * 1000;
+
+	ret = select(sock + 1, &fd, NULL, NULL, &timeout);
+	if (ret <= 0) goto done;
+
+	addr_from_len = sizeof(addr_from);
+	ret = recvfrom(sock, (char *)buf, sizeof(buf), 0,
+	               (struct sockaddr *)&addr_from, &addr_from_len);
+	if (ret < 5) goto done;
+
+	// reply starts with "\xff\xff\xff\xffn"
+	if (memcmp(buf, "\xff\xff\xff\xffn", 5) != 0) goto done;
+
+	// parse entries: 4 bytes ip, 2 bytes port, 2 bytes ping
+	{
+		const byte *p = buf + 5;
+		const byte *end = buf + ret;
+		while (p + 8 <= end) {
+			short dist;
+			if (memcmp(p, dest_addr->ip, 4) == 0) {
+				// port at p+4, ping at p+6
+				memcpy(&dist, p + 6, 2);
+				dist = (short)LittleShort(dist);
+				if (dist >= 0)
+					result = (int)dist;
+				break;
+			}
+			p += 8;
+		}
+	}
+
+done:
+	closesocket(sock);
+	return result;
+}
+
+// ─────────────────────────────────────────────
+// Measure full chain ping: you->proxy->destination
+//
+// For proxy routes:
+//   1. Get you->proxy ping (browser or A2A_PING)
+//   2. Query the proxy directly for its ping to the destination
+//      using the qwfwd "pingstatus" packet (same protocol the ping tree uses)
+//   3. total = you->proxy + proxy->dest
+//
+// For direct routes: browser ping preferred, A2A_PING as last resort.
 // ─────────────────────────────────────────────
 static qbool CL_BR_MeasureCandidate(const char *proxylist, qbool via_proxy,
                                      float *out_ping, float *out_loss)
@@ -357,42 +435,62 @@ static qbool CL_BR_MeasureCandidate(const char *proxylist, qbool via_proxy,
 	if (proxylist && proxylist[0]) {
 		char first_hop[64];
 		netadr_t hop_addr;
+		float proxy_ping, proxy_loss;
 
 		CL_BR_GetFirstHop(proxylist, first_hop, sizeof(first_hop));
 
-		// Try cache first
+		// Try cache first (cache stores already-computed total ping)
 		if (CL_BR_GetCached(first_hop, out_ping, out_loss))
 			return true;
 
 		NET_StringToAdr(first_hop, &hop_addr);
 
-		// Browser ping is most accurate
+		// Step 1: measure you -> proxy
 		{
 			int bp = CL_BR_GetBrowserPing(&hop_addr);
 			if (bp >= 0) {
-				*out_ping = (float)bp;
-				*out_loss = 0;
-				CL_BR_StoreCached(first_hop, *out_ping, *out_loss);
-				return true;
+				proxy_ping = (float)bp;
+				proxy_loss = 0;
+			} else if (CL_BR_MeasureHop(&hop_addr, &proxy_ping, &proxy_loss)) {
+				// measured via A2A_PING
+			} else {
+				return false;  // proxy unreachable
 			}
 		}
 
-		// Fallback: A2A_PING
-		if (CL_BR_MeasureHop(&hop_addr, out_ping, out_loss)) {
-			CL_BR_StoreCached(first_hop, *out_ping, *out_loss);
-			return true;
+		// Step 2: query proxy for its ping to the destination server
+		{
+			int proxy_to_dest = CL_BR_GetProxyPingToServer(&hop_addr, &br_target_addr);
+
+			if (proxy_to_dest >= 0) {
+				// accurate: proxy reported its actual ping to the destination
+				*out_ping = proxy_ping + (float)proxy_to_dest;
+			} else {
+				// proxy didn't report dest in its list — fall back to browser direct ping
+				int dest_direct = CL_BR_GetBrowserPing(&br_target_addr);
+				if (dest_direct > 0) {
+					float dest_hop = (float)dest_direct - proxy_ping;
+					if (dest_hop < 1.0f) dest_hop = 1.0f;
+					*out_ping = proxy_ping + dest_hop;
+				} else {
+					// last resort: assume proxy->dest ~ proxy_ping (symmetric estimate)
+					*out_ping = proxy_ping * 2.0f;
+				}
+			}
+			*out_loss = proxy_loss;
 		}
-		return false;
+
+		CL_BR_StoreCached(first_hop, *out_ping, *out_loss);
+		return true;
 
 	} else {
-		// Direct: browser ping only (A2A_PING on game servers is unreliable)
+		// Direct: browser ping preferred, A2A_PING as last resort
 		int bp = CL_BR_GetBrowserPing(&br_target_addr);
 		if (bp >= 0) {
 			*out_ping = (float)bp;
 			*out_loss = 0;
 			return true;
 		}
-		// Last resort: A2A_PING
 		return CL_BR_MeasureHop(&br_target_addr, out_ping, out_loss);
 	}
 }
@@ -504,37 +602,39 @@ void CL_Connect_BestRoute_f(void)
 	}
 
 	// ── Ping tree best proxy path (only if ping tree was built) ───────
+	// SB_PingTree_GetProxyString returns the Dijkstra total cost in
+	// out_total_ping_ms which already accounts for the full chain:
+	// you -> proxy -> ... -> server.  We use that directly instead of
+	// re-measuring only the first hop.
 	if (SB_PingTree_Built() && br_route_count < CONNECTBR_MAX_ROUTES - 1) {
 		int pathlen = SB_PingTree_GetPathLen(&br_target_addr);
 		if (pathlen > 0) {
-			int  dummy = 0;
+			int  total_ping_ms = 0;
 			char proxy_str[MAX_PROXYLIST];
 
 			if (SB_PingTree_GetProxyString(&br_target_addr, proxy_str,
-			                               sizeof(proxy_str), &dummy)) {
-				float ping, loss;
-				Com_Printf("  [ping tree best (%d hop%s)]... ",
-				           pathlen, pathlen > 1 ? "s" : "");
+			                               sizeof(proxy_str), &total_ping_ms)
+			    && total_ping_ms > 0) {
+				float ping = (float)total_ping_ms;
+				float loss = 0;
 
-				if (CL_BR_MeasureCandidate(proxy_str, true, &ping, &loss)) {
-					Com_Printf("ping=%s%.0fms&r  loss=%s%.0f%%&r\n",
-					           CL_BR_PingColor(ping), ping,
-					           CL_BR_LossColor(loss), loss);
-					strlcpy(br_routes[br_route_count].proxylist, proxy_str,
-					        sizeof(br_routes[0].proxylist));
-					snprintf(br_routes[br_route_count].label,
-					         sizeof(br_routes[0].label),
-					         "ping tree best (%d hop%s)",
-					         pathlen, pathlen > 1 ? "s" : "");
-					br_routes[br_route_count].ping_ms   = ping;
-					br_routes[br_route_count].loss_pct  = loss;
-					br_routes[br_route_count].score     = CL_BR_Score(ping, loss, true);
-					br_routes[br_route_count].via_proxy = true;
-					br_routes[br_route_count].valid     = true;
-					br_route_count++;
-				} else {
-					Com_Printf("&cf00unreachable&r\n");
-				}
+				Com_Printf("  [ping tree best (%d hop%s)]... ", pathlen, pathlen > 1 ? "s" : "");
+				Com_Printf("ping=%s%.0fms&r  loss=%s%.0f%%&r\n",
+				           CL_BR_PingColor(ping), ping,
+				           CL_BR_LossColor(loss), loss);
+
+				strlcpy(br_routes[br_route_count].proxylist, proxy_str,
+				        sizeof(br_routes[0].proxylist));
+				snprintf(br_routes[br_route_count].label,
+				         sizeof(br_routes[0].label),
+				         "ping tree best (%d hop%s)",
+				         pathlen, pathlen > 1 ? "s" : "");
+				br_routes[br_route_count].ping_ms   = ping;
+				br_routes[br_route_count].loss_pct  = loss;
+				br_routes[br_route_count].score     = CL_BR_Score(ping, loss, true);
+				br_routes[br_route_count].via_proxy = true;
+				br_routes[br_route_count].valid     = true;
+				br_route_count++;
 			}
 		}
 	}
