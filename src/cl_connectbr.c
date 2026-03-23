@@ -12,7 +12,7 @@ and picks the best combined path.
 #include "EX_browser.h"
 #include "cl_connectbr.h"
 
-#define CONNECTBR_MAX_ROUTES     5
+#define CONNECTBR_MAX_ROUTES     6    // +1 slot for direct connection
 #define CONNECTBR_TEST_PACKETS   20
 #define CONNECTBR_TIMEOUT_MS     600
 #define CONNECTBR_PACKET_DELAY   15   // ms between packets
@@ -22,30 +22,26 @@ and picks the best combined path.
 #define WEIGHT_JITTER   0.3f
 #define WEIGHT_LOSS     0.2f
 
+// Ping colour thresholds for console output
+#define PING_GREEN      70    // <= green  (good)
+#define PING_ORANGE     130   // <= orange (acceptable)
+                              // >  red    (bad)
+
 // Ping normalisation references.
-//
-// These are the "expected good" ping ceilings for each route type.
-// A ping AT this value scores 0.50 on the ping component (neutral).
-// Below = good, above = bad — but the curve is gradual, not a cliff.
-//
-// Direct connection:  <50ms great, 80ms ok.    Reference = 80ms.
-// Via proxy (Miami, Lisboa, etc.): <100ms great, 130ms good, 160ms ok.
-//                                              Reference = 160ms.
-//
-// This means a 130ms proxy route scores well and is NOT penalised against
-// a 50ms direct route just because the absolute number is higher.
+// Direct:    <50ms great, 80ms ok   → reference 80ms
+// Via proxy: <100ms great, 130ms ok → reference 160ms
 #define PING_REF_DIRECT_MS    80.0f
 #define PING_REF_PROXY_MS    160.0f
 
 typedef struct route_candidate_s {
 	char    proxylist[512];  // value for cl_proxyaddr (empty = direct)
 	char    label[128];      // human-readable name
-	float   ping_ms;         // estimated total ping via this route (proxy + server)
+	float   ping_ms;         // total estimated ping for this route
 	float   jitter_ms;       // measured jitter to first hop
 	float   loss_pct;        // measured packet loss to first hop
 	float   score;           // lower = better
-	float   proxy_ping_ms;   // raw ping to first hop proxy (for display)
-	qbool   via_proxy;       // true if route goes through at least one proxy
+	float   proxy_ping_ms;   // raw measured ping to first hop (display only)
+	qbool   via_proxy;
 	qbool   valid;
 } route_candidate_t;
 
@@ -57,14 +53,23 @@ static netadr_t          br_target_addr;
 static qbool             br_active        = false;
 
 // ─────────────────────────────────────────────
+// Colour-coded ping string for console output.
+// green <= 70ms, orange <= 130ms, red > 130ms
+// ─────────────────────────────────────────────
+static const char *CL_BR_PingColor(float ms)
+{
+	if (ms <= PING_GREEN)  return "&c0f0";   // green
+	if (ms <= PING_ORANGE) return "&cfa0";   // orange
+	return "&cf00";                           // red
+}
+
+// ─────────────────────────────────────────────
 // Look up the server browser ping for a given address.
 // Returns -1 if not found.
 //
-// The server browser already measured RTT using the same A2S/QW
-// status protocol — reusing it avoids a redundant probe and, more
-// importantly, avoids the A2A_PING distortion (servers may queue
-// A2A_PING at lower priority, producing RTTs 5-10x higher than the
-// real in-game ping).
+// Reusing browser ping avoids the A2A_PING distortion: game servers
+// may handle A2A_PING in a low-priority path, returning RTTs 5-10x
+// higher than the real in-game ping.
 // ─────────────────────────────────────────────
 static int CL_BR_GetBrowserPing(const netadr_t *dest)
 {
@@ -81,14 +86,9 @@ static int CL_BR_GetBrowserPing(const netadr_t *dest)
 }
 
 // ─────────────────────────────────────────────
-// Measure quality of a single hop to dest using A2A_PING.
-//
-// NOTE: Only use this for PROXY hops. For direct server connections,
-// use CL_BR_GetBrowserPing() instead — A2A_PING can return RTTs
-// 5-10x higher than the real in-game ping because servers may handle
-// these out-of-band probes in a low-priority or rate-limited path.
-//
-// Returns false if completely unreachable.
+// Measure RTT to a proxy hop using A2A_PING.
+// Do NOT use for direct game server connections — use
+// CL_BR_GetBrowserPing() instead to avoid protocol distortion.
 // ─────────────────────────────────────────────
 static qbool CL_BR_MeasureHop(const netadr_t *dest,
                                float *out_ping,
@@ -192,18 +192,8 @@ static qbool CL_BR_MeasureHop(const netadr_t *dest,
 
 // ─────────────────────────────────────────────
 // Score a route (lower = better).
-//
-// Ping is normalised against a reference that depends on route type:
-//
-//   Direct:     reference = PING_REF_DIRECT_MS (80ms)
-//     40ms → 0.25 (great)   80ms → 0.50 (ok)   160ms → 1.0 (bad)
-//
-//   Via proxy:  reference = PING_REF_PROXY_MS (160ms)
-//     80ms → 0.25 (great)  130ms → 0.41 (good)  160ms → 0.50 (ok)
-//
-// A 130ms proxy route scores 0.41 — clearly good.
-// A 50ms direct route scores 0.31 — slightly better but comparable.
-// Neither unfairly dominates the other.
+// Ping normalised per route type so a good proxy ping (130ms) is not
+// unfairly penalised against a good direct ping (50ms).
 // ─────────────────────────────────────────────
 static float CL_BR_Score(float total_ping, float jitter, float loss,
                           qbool via_proxy)
@@ -220,9 +210,7 @@ static float CL_BR_Score(float total_ping, float jitter, float loss,
 
 // ─────────────────────────────────────────────
 // Parse the FIRST proxy in a chain (closest to us).
-//
-// qwfwd chain format: "proxy1@proxy2@proxy3"
-// The client connects to proxy1 first — that is our first hop.
+// Format: "proxy1@proxy2@proxy3" — client connects to proxy1 first.
 // ─────────────────────────────────────────────
 static void CL_BR_GetFirstHop(const char *proxylist, char *out, size_t outsz)
 {
@@ -238,7 +226,14 @@ static void CL_BR_GetFirstHop(const char *proxylist, char *out, size_t outsz)
 }
 
 // ─────────────────────────────────────────────
-// Build candidate list from ping tree + server list.
+// Build candidate list.
+//
+// Order: ping tree best path first, then individual proxies from the
+// server list, then direct connection last.
+//
+// The ping tree candidate uses the proxy address it resolved —
+// we do NOT re-invoke SB_PingTree_ConnectBestPath() during connect
+// to avoid it interfering with the actual connection attempt.
 // ─────────────────────────────────────────────
 static int CL_BR_BuildCandidates(const netadr_t *addr,
                                   route_candidate_t *candidates)
@@ -252,22 +247,26 @@ static int CL_BR_BuildCandidates(const netadr_t *addr,
 	memset(candidates, 0, sizeof(route_candidate_t) * CONNECTBR_MAX_ROUTES);
 	strlcpy(saved_proxy, cl_proxyaddr.string, sizeof(saved_proxy));
 
-	// --- Route via ping tree best path ---
+	// --- Ping tree best path ---
+	// We call ConnectBestPath once here only to READ the resolved proxy
+	// string, then immediately restore the original value.
+	// The actual connect command will set cl_proxyaddr from the saved
+	// proxylist — the ping tree is NOT called again at connect time.
 	pathlen = SB_PingTree_GetPathLen(addr);
 	if (pathlen > 0) {
 		SB_PingTree_ConnectBestPath(addr);
 		strlcpy(candidates[count].proxylist,
 		        cl_proxyaddr.string,
 		        sizeof(candidates[count].proxylist));
+		Cvar_Set(&cl_proxyaddr, saved_proxy); // restore immediately
 		snprintf(candidates[count].label, sizeof(candidates[count].label),
 		         "ping tree best (%d hop%s)", pathlen, pathlen > 1 ? "s" : "");
-		candidates[count].ping_ms   = 0;
+		candidates[count].ping_ms   = 0; // measured below
 		candidates[count].via_proxy = (candidates[count].proxylist[0] != '\0');
 		count++;
-		Cvar_Set(&cl_proxyaddr, saved_proxy);
 	}
 
-	// --- Try each proxy in the server list individually ---
+	// --- Individual proxies from server list ---
 	SB_ServerList_Lock();
 	for (i = 0; i < serversn && count < CONNECTBR_MAX_ROUTES - 1; i++) {
 		server_data *s = servers[i];
@@ -282,16 +281,16 @@ static int CL_BR_BuildCandidates(const netadr_t *addr,
 		         s->address.ip[2], s->address.ip[3],
 		         ntohs(s->address.port));
 
+		// Skip if already covered by ping tree candidate
 		if (count > 0 && strcmp(candidates[0].proxylist, proxy_ip) == 0)
 			continue;
 
 #ifdef HAVE_PROXY_SERVER_PING
 		total_estimated_ping = (float)s->ping + (float)s->ping_to_server;
 #else
-		// Conservative estimate: proxy->server adds roughly the same as
-		// our ping to the proxy. Prevents a geographically distant proxy
-		// with a low our->proxy ping (e.g. Lisboa) from beating a closer
-		// proxy that has a shorter total path to the target server.
+		// Conservative: assume proxy->server ≈ our ping to proxy.
+		// Prevents a distant proxy with low our->proxy ping (e.g. Lisboa)
+		// from ranking above a local proxy with a shorter total path.
 		total_estimated_ping = (float)s->ping * 2.0f;
 #endif
 
@@ -306,11 +305,11 @@ static int CL_BR_BuildCandidates(const netadr_t *addr,
 	}
 	SB_ServerList_Unlock();
 
-	// --- Always offer direct connection as last option ---
+	// --- Direct connection (always last candidate) ---
 	candidates[count].proxylist[0] = '\0';
 	strlcpy(candidates[count].label, "direct connection",
 	        sizeof(candidates[count].label));
-	candidates[count].ping_ms   = 0;
+	candidates[count].ping_ms   = 0; // measured below
 	candidates[count].via_proxy = false;
 	count++;
 
@@ -318,27 +317,33 @@ static int CL_BR_BuildCandidates(const netadr_t *addr,
 }
 
 // ─────────────────────────────────────────────
-// Apply route N and connect
+// Apply route idx and issue the connect command.
+// cl_proxyaddr is set from the saved proxylist — no ping tree
+// call happens here, so it cannot interfere with the connection.
 // ─────────────────────────────────────────────
 static void CL_BR_ApplyRoute(int idx)
 {
 	extern cvar_t cl_proxyaddr;
 	route_candidate_t *r = &br_routes[idx];
+	const char *pc = CL_BR_PingColor(r->ping_ms);
 
+	// Set proxy from the stored string (empty = direct, no proxy)
 	Cvar_Set(&cl_proxyaddr, r->proxylist);
 
-	Com_Printf("\n&cf80connectbr:&r Connecting via route #%d — %s\n",
-	           idx + 1, r->label);
-	Com_Printf("  ping (total est.):&cf80%.0fms&r  jitter:&cf80%.0fms&r  loss:&cf80%.0f%%&r\n",
-	           r->ping_ms, r->jitter_ms, r->loss_pct);
+	Com_Printf("\n&cf80connectbr:&r route #%d — %s\n", idx + 1, r->label);
+	Com_Printf("  ping: %s%.0fms&r  jitter: %s%.0fms&r  loss: %s%.0f%%&r\n",
+	           pc, r->ping_ms,
+	           CL_BR_PingColor(r->jitter_ms), r->jitter_ms,
+	           r->loss_pct > 5 ? "&cf00" : "&c0f0", r->loss_pct);
 
 	if (idx + 1 < br_route_count) {
-		Com_Printf("  Type &cf80connectnext&r to try route #%d (%s)\n",
+		Com_Printf("  type &cf80connectnext&r for route #%d (%s)\n",
 		           idx + 2, br_routes[idx + 1].label);
 	} else {
-		Com_Printf("  This was the last available route.\n");
+		Com_Printf("  no more routes available.\n");
 	}
 
+	// Issue connect directly — cl_proxyaddr is already set above.
 	Cbuf_AddText(va("connect %s\n", NET_AdrToString(br_target_addr)));
 }
 
@@ -352,8 +357,8 @@ void CL_Connect_BestRoute_f(void)
 
 	if (Cmd_Argc() != 2) {
 		Com_Printf("Usage: connectbr <address>\n");
-		Com_Printf("Tests up to %d routes (ping+jitter+loss) and connects via best.\n",
-		           CONNECTBR_MAX_ROUTES);
+		Com_Printf("Tests up to %d routes and connects via the best one.\n",
+		           CONNECTBR_MAX_ROUTES - 1);
 		Com_Printf("Use 'connectnext' to try the next route if needed.\n");
 		Com_Printf("Requires: sb_findroutes 1 + server browser refreshed.\n");
 		return;
@@ -386,7 +391,7 @@ void CL_Connect_BestRoute_f(void)
 		return;
 	}
 
-	Com_Printf("\n&cf80connectbr:&r Testing %d route(s) to %s...\n\n",
+	Com_Printf("\n&cf80connectbr:&r testing %d route(s) to %s...\n\n",
 	           candidate_count, Cmd_Argv(1));
 
 	br_route_count   = 0;
@@ -394,8 +399,7 @@ void CL_Connect_BestRoute_f(void)
 	br_active        = false;
 
 	for (i = 0; i < candidate_count && br_route_count < CONNECTBR_MAX_ROUTES; i++) {
-		float hop_ping, jitter, loss;
-		float total_ping;
+		float hop_ping, jitter, loss, total_ping;
 		qbool ok;
 		netadr_t hop_addr;
 		char first_hop[64];
@@ -403,25 +407,22 @@ void CL_Connect_BestRoute_f(void)
 		Com_Printf("  [%d/%d] %s... ", i + 1, candidate_count, candidates[i].label);
 
 		if (candidates[i].proxylist[0]) {
-			// Proxy route: measure RTT to the first hop (closest proxy).
-			// Proxies respond to A2A_PING reliably without priority distortion.
+			// Proxy: measure RTT to the first (closest) hop via A2A_PING.
+			// Proxies respond to this reliably without priority distortion.
 			CL_BR_GetFirstHop(candidates[i].proxylist, first_hop, sizeof(first_hop));
 			NET_StringToAdr(first_hop, &hop_addr);
 			ok = CL_BR_MeasureHop(&hop_addr, &hop_ping, &jitter, &loss);
 		} else {
-			// Direct connection: reuse the server browser ping instead of
-			// probing with A2A_PING. Game servers may handle A2A_PING in a
-			// low-priority or rate-limited path, producing RTTs far higher
-			// than the real in-game ping (163ms measured vs 12ms in-game).
+			// Direct: reuse server browser ping to avoid A2A_PING distortion.
+			// (A2A_PING on game servers can read 10x higher than actual in-game ping.)
 			int browser_ping = CL_BR_GetBrowserPing(&br_target_addr);
 			if (browser_ping >= 0) {
 				hop_ping = (float)browser_ping;
-				jitter   = 0;  // browser does not expose jitter
-				loss     = 0;  // server would not appear in browser if lossy
+				jitter   = 0;
+				loss     = 0;
 				ok       = true;
-				Com_Printf("(browser ping) ");
 			} else {
-				// Not in browser — fall back to A2A_PING
+				// Not in browser cache — fall back to A2A_PING
 				hop_addr = br_target_addr;
 				ok = CL_BR_MeasureHop(&hop_addr, &hop_ping, &jitter, &loss);
 			}
@@ -432,14 +433,25 @@ void CL_Connect_BestRoute_f(void)
 			continue;
 		}
 
-		// Replace the estimated first-hop component with the measured value,
-		// keeping the remainder of the estimated path (proxy -> server).
+		// For proxy routes: total = measured first hop + remaining estimated hops.
+		// This replaces only the component we actually measured, keeping the
+		// proxy->server estimate from BuildCandidates for the rest of the path.
 		if (candidates[i].via_proxy && candidates[i].proxy_ping_ms > 0) {
 			float remaining = candidates[i].ping_ms - candidates[i].proxy_ping_ms;
 			if (remaining < 0) remaining = 0;
 			total_ping = hop_ping + remaining;
 		} else {
 			total_ping = hop_ping;
+		}
+
+		{
+			const char *pc = CL_BR_PingColor(total_ping);
+			const char *jc = CL_BR_PingColor(jitter);
+			Com_Printf("hop=%s%.0fms&r  total=%s%.0fms&r  jitter=%s%.0fms&r  loss=%.0f%%\n",
+			           CL_BR_PingColor(hop_ping), hop_ping,
+			           pc, total_ping,
+			           jc, jitter,
+			           loss);
 		}
 
 		br_routes[br_route_count]               = candidates[i];
@@ -450,9 +462,6 @@ void CL_Connect_BestRoute_f(void)
 		br_routes[br_route_count].score         = CL_BR_Score(total_ping, jitter, loss,
 		                                                       candidates[i].via_proxy);
 		br_routes[br_route_count].valid         = true;
-
-		Com_Printf("hop=&cf80%.0fms&r  total_est=&cf80%.0fms&r  jitter=&cf80%.0fms&r  loss=&cf80%.0f%%&r\n",
-		           hop_ping, total_ping, jitter, loss);
 		br_route_count++;
 	}
 
@@ -475,15 +484,16 @@ void CL_Connect_BestRoute_f(void)
 		}
 	}
 
-	// Show ranking
-	Com_Printf("\n&cf80--- Route ranking ---&r\n");
+	// Show ranking with colour-coded pings
+	Com_Printf("\n&cf80--- route ranking ---&r\n");
 	for (i = 0; i < br_route_count; i++) {
+		const char *pc = CL_BR_PingColor(br_routes[i].ping_ms);
 		Com_Printf("  #%d %s\n"
-		           "     hop=%.0fms  total_est=%.0fms  jitter=%.0fms  loss=%.0f%%\n",
+		           "     hop=%s%.0fms&r  total=%s%.0fms&r  jitter=%s%.0fms&r  loss=%.0f%%\n",
 		           i + 1, br_routes[i].label,
-		           br_routes[i].proxy_ping_ms,
-		           br_routes[i].ping_ms,
-		           br_routes[i].jitter_ms,
+		           CL_BR_PingColor(br_routes[i].proxy_ping_ms), br_routes[i].proxy_ping_ms,
+		           pc, br_routes[i].ping_ms,
+		           CL_BR_PingColor(br_routes[i].jitter_ms), br_routes[i].jitter_ms,
 		           br_routes[i].loss_pct);
 	}
 
