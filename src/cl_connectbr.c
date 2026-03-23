@@ -104,6 +104,7 @@ static int       br_current_route = 0;
 static netadr_t  br_target_addr;
 static qbool     br_active        = false;
 static qbool     br_measuring     = false;
+static char      br_ranking_buf[4096];  /* ranking pre-formatado, impresso na thread principal */
 
 // --------------------------------------------
 // Colour helpers
@@ -493,6 +494,10 @@ static void CL_BR_ApplyRoute(int idx)
 {
 	route_t *r = &br_routes[idx];
 
+	/* Imprime ranking completo apenas na primeira rota (thread principal = seguro) */
+	if (idx == 0 && br_ranking_buf[0])
+		Com_Printf("%s", br_ranking_buf);
+
 	Cvar_Set(&cl_proxyaddr, "");
 	if (r->proxylist[0])
 		Cvar_Set(&cl_proxyaddr, r->proxylist);
@@ -758,14 +763,21 @@ step_direct:
 		br_route_count = 10;
 
 	if (verbose >= 1) {
-		int show = (br_route_count < 6) ? br_route_count : 6;
-		Com_Printf("\n&cf80--- route ranking (top %d) ---&r\n", show);
+		int  show = (br_route_count < 6) ? br_route_count : 6;
+		char tmp[256];
+		br_ranking_buf[0] = '\0';
+		snprintf(tmp, sizeof(tmp), "\n&cf80connectbr: top %d routes&r\n", show);
+		strlcat(br_ranking_buf, tmp, sizeof(br_ranking_buf));
 		for (i = 0; i < show; i++) {
-			Com_Printf("  #%d %s\n     ping=%s%.0fms&r  loss=%s%.1f%%&r\n",
-			           i + 1, br_routes[i].label,
-			           CL_BR_PingColor(br_routes[i].ping_ms), br_routes[i].ping_ms,
-			           CL_BR_LossColor(br_routes[i].loss_pct), br_routes[i].loss_pct);
+			snprintf(tmp, sizeof(tmp), "  &cf80#%d&r  %s%.0fms&r  %s%.1f%%&r  %s\n",
+			         i + 1,
+			         CL_BR_PingColor(br_routes[i].ping_ms), br_routes[i].ping_ms,
+			         CL_BR_LossColor(br_routes[i].loss_pct), br_routes[i].loss_pct,
+			         br_routes[i].label);
+			strlcat(br_ranking_buf, tmp, sizeof(br_ranking_buf));
 		}
+	} else {
+		br_ranking_buf[0] = '\0';
 	}
 
 	br_current_route = 0;
