@@ -208,9 +208,9 @@ static qbool CL_BR_MeasureHop(const netadr_t *dest,
 	if (test_packets < 5)  test_packets = 5;
 	if (test_packets > 50) test_packets = 50;
 
-	send_times = (double *)Z_Malloc(test_packets * sizeof(double));
-	recv_times = (double *)Z_Malloc(test_packets * sizeof(double));
-	received   = (qbool  *)Z_Malloc(test_packets * sizeof(qbool));
+	send_times = (double *)Q_malloc(test_packets * sizeof(double));
+	recv_times = (double *)Q_malloc(test_packets * sizeof(double));
+	received   = (qbool  *)Q_malloc(test_packets * sizeof(qbool));
 
 	memset(received,   0, test_packets * sizeof(qbool));
 	memset(send_times, 0, test_packets * sizeof(double));
@@ -282,9 +282,9 @@ static qbool CL_BR_MeasureHop(const netadr_t *dest,
 
 cleanup:
 	if (sock != INVALID_SOCKET) closesocket(sock);
-	Z_Free(send_times);
-	Z_Free(recv_times);
-	Z_Free(received);
+	Q_free(send_times);
+	Q_free(recv_times);
+	Q_free(received);
 	return success;
 }
 
