@@ -57,8 +57,38 @@ static netadr_t          br_target_addr;
 static qbool             br_active        = false;
 
 // ─────────────────────────────────────────────
-// Measure quality of a single hop to dest
-// Returns false if completely unreachable
+// Look up the server browser ping for a given address.
+// Returns -1 if not found.
+//
+// The server browser already measured RTT using the same A2S/QW
+// status protocol — reusing it avoids a redundant probe and, more
+// importantly, avoids the A2A_PING distortion (servers may queue
+// A2A_PING at lower priority, producing RTTs 5-10x higher than the
+// real in-game ping).
+// ─────────────────────────────────────────────
+static int CL_BR_GetBrowserPing(const netadr_t *dest)
+{
+	int i, best = -1;
+	SB_ServerList_Lock();
+	for (i = 0; i < serversn; i++) {
+		if (NET_CompareAdr(servers[i]->address, *dest) && servers[i]->ping >= 0) {
+			best = servers[i]->ping;
+			break;
+		}
+	}
+	SB_ServerList_Unlock();
+	return best;
+}
+
+// ─────────────────────────────────────────────
+// Measure quality of a single hop to dest using A2A_PING.
+//
+// NOTE: Only use this for PROXY hops. For direct server connections,
+// use CL_BR_GetBrowserPing() instead — A2A_PING can return RTTs
+// 5-10x higher than the real in-game ping because servers may handle
+// these out-of-band probes in a low-priority or rate-limited path.
+//
+// Returns false if completely unreachable.
 // ─────────────────────────────────────────────
 static qbool CL_BR_MeasureHop(const netadr_t *dest,
                                float *out_ping,
@@ -373,13 +403,29 @@ void CL_Connect_BestRoute_f(void)
 		Com_Printf("  [%d/%d] %s... ", i + 1, candidate_count, candidates[i].label);
 
 		if (candidates[i].proxylist[0]) {
+			// Proxy route: measure RTT to the first hop (closest proxy).
+			// Proxies respond to A2A_PING reliably without priority distortion.
 			CL_BR_GetFirstHop(candidates[i].proxylist, first_hop, sizeof(first_hop));
 			NET_StringToAdr(first_hop, &hop_addr);
+			ok = CL_BR_MeasureHop(&hop_addr, &hop_ping, &jitter, &loss);
 		} else {
-			hop_addr = br_target_addr;
+			// Direct connection: reuse the server browser ping instead of
+			// probing with A2A_PING. Game servers may handle A2A_PING in a
+			// low-priority or rate-limited path, producing RTTs far higher
+			// than the real in-game ping (163ms measured vs 12ms in-game).
+			int browser_ping = CL_BR_GetBrowserPing(&br_target_addr);
+			if (browser_ping >= 0) {
+				hop_ping = (float)browser_ping;
+				jitter   = 0;  // browser does not expose jitter
+				loss     = 0;  // server would not appear in browser if lossy
+				ok       = true;
+				Com_Printf("(browser ping) ");
+			} else {
+				// Not in browser — fall back to A2A_PING
+				hop_addr = br_target_addr;
+				ok = CL_BR_MeasureHop(&hop_addr, &hop_ping, &jitter, &loss);
+			}
 		}
-
-		ok = CL_BR_MeasureHop(&hop_addr, &hop_ping, &jitter, &loss);
 
 		if (!ok) {
 			Com_Printf("&cf00unreachable&r\n");
