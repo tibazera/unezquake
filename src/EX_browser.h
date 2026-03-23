@@ -298,6 +298,13 @@ void SB_PingTree_ConnectBestPath(const netadr_t *addr);
 int SB_PingTree_GetPathLen(const netadr_t *addr);
 void SB_Proxylist_Unserialize_f(void);
 
+// Returns the proxy chain string for the best path to addr WITHOUT
+// modifying cl_proxyaddr or issuing any connect command.
+// out receives "proxy1:port" or "proxy1:port@proxy2:port" etc.
+// Returns true if a proxy route was found, false if direct is best or no route.
+qbool SB_PingTree_GetProxyString(const netadr_t *addr, char *out, size_t outsz,
+                                  int *out_total_ping_ms);
+
 #define SB_TRIGGER_REFRESHDONE        1
 #define SB_TRIGGER_SOURCESUPDATED     2
 #define SB_TRIGGER_NOTIFY_PINGTREE    4
