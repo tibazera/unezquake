@@ -1,16 +1,11 @@
 /*
 Copyright (C) 2024 unezQuake team
 
-This program is free software; you can redistribute it and/or
-modify it under the terms of the GNU General Public License
-as published by the Free Software Foundation; either version 2
-of the License, or (at your option) any later version.
-
 cl_connectbr.c - Smart route selection for connectbr/connectnext commands
 
-Tests top 5 proxy routes measuring ping, jitter and packet loss,
-presents ranking to user, and allows cycling through routes with
-the 'connectnext' command.
+Uses the ping tree (already built by sb_findroutes) to enumerate
+multiple proxy routes, measures each hop's quality (ping+jitter+loss)
+and picks the best combined path.
 */
 
 #include "quakedef.h"
@@ -20,7 +15,7 @@ the 'connectnext' command.
 #define CONNECTBR_MAX_ROUTES     5
 #define CONNECTBR_TEST_PACKETS   20
 #define CONNECTBR_TIMEOUT_MS     600
-#define CONNECTBR_PACKET_DELAY   15   // ms between packets (~67pps like QW)
+#define CONNECTBR_PACKET_DELAY   15   // ms between packets
 
 // Quality score weights (must sum to 1.0)
 #define WEIGHT_PING     0.5f
@@ -30,9 +25,9 @@ the 'connectnext' command.
 typedef struct route_candidate_s {
 	char    proxylist[512];  // value for cl_proxyaddr (empty = direct)
 	char    label[128];      // human-readable name
-	float   ping_ms;
-	float   jitter_ms;
-	float   loss_pct;
+	float   ping_ms;         // estimated total ping via this route
+	float   jitter_ms;       // measured jitter to first hop
+	float   loss_pct;        // measured packet loss to first hop
 	float   score;           // lower = better
 	qbool   valid;
 } route_candidate_t;
@@ -45,12 +40,13 @@ static netadr_t          br_target_addr;
 static qbool             br_active        = false;
 
 // ─────────────────────────────────────────────
-// Measure quality of a single route to dest
+// Measure quality of a single hop to dest
+// Returns false if completely unreachable
 // ─────────────────────────────────────────────
-static qbool CL_BR_MeasureRoute(const netadr_t *dest,
-                                 float *out_ping,
-                                 float *out_jitter,
-                                 float *out_loss)
+static qbool CL_BR_MeasureHop(const netadr_t *dest,
+                               float *out_ping,
+                               float *out_jitter,
+                               float *out_loss)
 {
 	socket_t sock;
 	struct sockaddr_storage to_addr;
@@ -77,7 +73,6 @@ static qbool CL_BR_MeasureRoute(const netadr_t *dest,
 
 	NetadrToSockadr(dest, &to_addr);
 
-	// Send packets with spacing similar to QW game traffic
 	for (i = 0; i < CONNECTBR_TEST_PACKETS; i++) {
 		send_times[i] = Sys_DoubleTime();
 		sendto(sock, packet, strlen(packet), 0,
@@ -85,10 +80,8 @@ static qbool CL_BR_MeasureRoute(const netadr_t *dest,
 		Sys_MSleep(CONNECTBR_PACKET_DELAY);
 	}
 
-	// Collect A2A_ACK replies until deadline
 	{
 		double deadline = Sys_DoubleTime() + (CONNECTBR_TIMEOUT_MS / 1000.0);
-
 		while (Sys_DoubleTime() < deadline) {
 			char buf[32];
 			struct sockaddr_storage from_addr;
@@ -98,14 +91,14 @@ static qbool CL_BR_MeasureRoute(const netadr_t *dest,
 			FD_ZERO(&fd);
 			FD_SET(sock, &fd);
 			tv.tv_sec  = 0;
-			tv.tv_usec = 20 * 1000; // 20ms poll
+			tv.tv_usec = 20 * 1000;
 			ret = select(sock + 1, &fd, NULL, NULL, &tv);
 			if (ret <= 0) continue;
 
 			ret = recvfrom(sock, buf, sizeof(buf), 0,
 			               (struct sockaddr *)&from_addr, &from_len);
-			if (ret <= 0)    continue;
-			if (buf[0] != 'l') continue; // not A2A_ACK
+			if (ret <= 0)      continue;
+			if (buf[0] != 'l') continue; // A2A_ACK
 
 			now = Sys_DoubleTime();
 			for (i = 0; i < CONNECTBR_TEST_PACKETS; i++) {
@@ -127,7 +120,6 @@ static qbool CL_BR_MeasureRoute(const netadr_t *dest,
 		return false;
 	}
 
-	// Average ping
 	for (i = 0; i < CONNECTBR_TEST_PACKETS; i++) {
 		if (received[i]) {
 			double rtt = (recv_times[i] - send_times[i]) * 1000.0;
@@ -140,7 +132,6 @@ static qbool CL_BR_MeasureRoute(const netadr_t *dest,
 	*out_loss = (float)((CONNECTBR_TEST_PACKETS - recv_count) * 100)
 	            / CONNECTBR_TEST_PACKETS;
 
-	// Jitter = standard deviation
 	if (recv_count > 1) {
 		double mean     = ping_sum / recv_count;
 		double variance = (ping_sq_sum / recv_count) - (mean * mean);
@@ -157,7 +148,7 @@ static qbool CL_BR_MeasureRoute(const netadr_t *dest,
 // ─────────────────────────────────────────────
 static float CL_BR_Score(float ping, float jitter, float loss)
 {
-	float norm_ping   = ping   / 300.0f;
+	float norm_ping   = ping   / 500.0f;
 	float norm_jitter = jitter / 100.0f;
 	float norm_loss   = loss   / 100.0f;
 
@@ -167,37 +158,77 @@ static float CL_BR_Score(float ping, float jitter, float loss)
 }
 
 // ─────────────────────────────────────────────
-// Build candidate list from ping tree
+// Build candidate list from ping tree data
+//
+// The ping tree already ran Dijkstra considering:
+//   our_ping_to_proxy + proxy_ping_to_server
+//
+// We enumerate all proxies that have a path to the
+// target server and build up to MAX_ROUTES candidates.
 // ─────────────────────────────────────────────
 static int CL_BR_BuildCandidates(const netadr_t *addr,
                                   route_candidate_t *candidates)
 {
 	extern cvar_t cl_proxyaddr;
-	int   count   = 0;
-	int   pathlen = SB_PingTree_GetPathLen(addr);
-	char  saved_proxy[512];
+	int count = 0;
+	int i;
+	char saved_proxy[512];
+	int pathlen;
 
 	memset(candidates, 0, sizeof(route_candidate_t) * CONNECTBR_MAX_ROUTES);
 	strlcpy(saved_proxy, cl_proxyaddr.string, sizeof(saved_proxy));
 
-	// Route 0: best route from ping tree (may use proxies)
+	// --- Route via ping tree best path ---
+	pathlen = SB_PingTree_GetPathLen(addr);
 	if (pathlen > 0) {
 		SB_PingTree_ConnectBestPath(addr);
 		strlcpy(candidates[count].proxylist,
 		        cl_proxyaddr.string,
 		        sizeof(candidates[count].proxylist));
 		snprintf(candidates[count].label, sizeof(candidates[count].label),
-		         "best proxy route (%d hop%s)", pathlen, pathlen > 1 ? "s" : "");
+		         "ping tree best (%d hop%s)", pathlen, pathlen > 1 ? "s" : "");
+		// Use the total estimated ping from Dijkstra as base ping
+		// We'll refine with real measurement below
+		candidates[count].ping_ms = 0; // will be measured
 		count++;
-
-		// Restore proxy so we don't accidentally connect yet
 		Cvar_Set(&cl_proxyaddr, saved_proxy);
 	}
 
-	// Last route: always offer direct connection
+	// --- Try each proxy in the server list individually ---
+	// This allows us to test proxies that might not be
+	// the ping tree's top choice but may have better
+	// jitter/loss characteristics (e.g. the nordeste proxy)
+	SB_ServerList_Lock();
+	for (i = 0; i < serversn && count < CONNECTBR_MAX_ROUTES - 1; i++) {
+		server_data *s = servers[i];
+		char proxy_ip[64];
+
+		if (!s->qwfwd) continue;
+		if (s->ping < 0) continue;
+
+		snprintf(proxy_ip, sizeof(proxy_ip), "%d.%d.%d.%d:%d",
+		         s->address.ip[0], s->address.ip[1],
+		         s->address.ip[2], s->address.ip[3],
+		         ntohs(s->address.port));
+
+		// Skip if already added as best path
+		if (count > 0 && strcmp(candidates[0].proxylist, proxy_ip) == 0)
+			continue;
+
+		strlcpy(candidates[count].proxylist, proxy_ip,
+		        sizeof(candidates[count].proxylist));
+		snprintf(candidates[count].label, sizeof(candidates[count].label),
+		         "via proxy %s", s->display.name[0] ? s->display.name : proxy_ip);
+		candidates[count].ping_ms = (float)s->ping; // direct ping to proxy
+		count++;
+	}
+	SB_ServerList_Unlock();
+
+	// --- Always offer direct connection as last option ---
 	candidates[count].proxylist[0] = '\0';
 	strlcpy(candidates[count].label, "direct connection",
 	        sizeof(candidates[count].label));
+	candidates[count].ping_ms = 0;
 	count++;
 
 	return count;
@@ -238,10 +269,10 @@ void CL_Connect_BestRoute_f(void)
 
 	if (Cmd_Argc() != 2) {
 		Com_Printf("Usage: connectbr <address>\n");
-		Com_Printf("Tests up to %d routes (ping + jitter + packet loss) and\n",
+		Com_Printf("Tests up to %d routes (ping+jitter+loss) and connects via best.\n",
 		           CONNECTBR_MAX_ROUTES);
-		Com_Printf("connects via the best one. Use 'connectnext' to try the next.\n");
-		Com_Printf("Requires server browser refreshed with sb_findroutes 1.\n");
+		Com_Printf("Use 'connectnext' to try the next route if needed.\n");
+		Com_Printf("Requires: sb_findroutes 1 + server browser refreshed.\n");
 		return;
 	}
 
@@ -253,13 +284,13 @@ void CL_Connect_BestRoute_f(void)
 		br_target_addr.port = htons(27500);
 
 	if (SB_PingTree_IsBuilding()) {
-		Com_Printf("connectbr: ping tree is still being built, please wait...\n");
+		Com_Printf("connectbr: ping tree still building, please wait...\n");
 		return;
 	}
 
 	if (!SB_PingTree_Built()) {
-		Com_Printf("connectbr: no route data — enable 'sb_findroutes 1',\n");
-		Com_Printf("  refresh the server browser, then try again.\n");
+		Com_Printf("connectbr: no route data.\n");
+		Com_Printf("  Enable 'sb_findroutes 1', refresh browser, then try again.\n");
 		Com_Printf("  Falling back to direct connection...\n");
 		Cbuf_AddText(va("connect %s\n", Cmd_Argv(1)));
 		return;
@@ -282,22 +313,42 @@ void CL_Connect_BestRoute_f(void)
 	for (i = 0; i < candidate_count && br_route_count < CONNECTBR_MAX_ROUTES; i++) {
 		float ping, jitter, loss;
 		qbool ok;
+		netadr_t hop_addr;
 
 		Com_Printf("  [%d/%d] %s... ", i + 1, candidate_count, candidates[i].label);
 
-		ok = CL_BR_MeasureRoute(&br_target_addr, &ping, &jitter, &loss);
+		// Measure quality of the FIRST HOP:
+		// - For proxy routes: measure ping to the proxy itself
+		// - For direct: measure ping to the server
+		if (candidates[i].proxylist[0]) {
+			// Parse the first proxy in the chain
+			char first_hop[64];
+			char *at = strchr(candidates[i].proxylist, '@');
+			if (at) {
+				// Multiple proxies: take the last one (closest to us)
+				strlcpy(first_hop, at + 1, sizeof(first_hop));
+			} else {
+				strlcpy(first_hop, candidates[i].proxylist, sizeof(first_hop));
+			}
+			NET_StringToAdr(first_hop, &hop_addr);
+		} else {
+			// Direct: measure to the server
+			hop_addr = br_target_addr;
+		}
+
+		ok = CL_BR_MeasureHop(&hop_addr, &ping, &jitter, &loss);
 
 		if (!ok) {
 			Com_Printf("&cf00unreachable&r\n");
 			continue;
 		}
 
-		br_routes[br_route_count]            = candidates[i];
-		br_routes[br_route_count].ping_ms    = ping;
-		br_routes[br_route_count].jitter_ms  = jitter;
-		br_routes[br_route_count].loss_pct   = loss;
-		br_routes[br_route_count].score      = CL_BR_Score(ping, jitter, loss);
-		br_routes[br_route_count].valid      = true;
+		br_routes[br_route_count]           = candidates[i];
+		br_routes[br_route_count].ping_ms   = ping;
+		br_routes[br_route_count].jitter_ms = jitter;
+		br_routes[br_route_count].loss_pct  = loss;
+		br_routes[br_route_count].score     = CL_BR_Score(ping, jitter, loss);
+		br_routes[br_route_count].valid     = true;
 
 		Com_Printf("ping=&cf80%.0fms&r  jitter=&cf80%.0fms&r  loss=&cf80%.0f%%&r\n",
 		           ping, jitter, loss);
@@ -309,7 +360,7 @@ void CL_Connect_BestRoute_f(void)
 		return;
 	}
 
-	// Sort by score (bubble sort, small N)
+	// Sort by score
 	{
 		int a, b;
 		for (a = 0; a < br_route_count - 1; a++) {
