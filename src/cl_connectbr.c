@@ -18,8 +18,7 @@ CVars:
   cl_connectbr_ping_green     - green ping threshold (default 40)
   cl_connectbr_ping_yellow    - yellow ping threshold (default 80)
   cl_connectbr_ping_orange    - orange/max playable threshold (default 200)
-  cl_connectbr_weight_ping    - score weight for ping (default 0.6)
-  cl_connectbr_weight_loss    - score weight for loss (default 0.4)
+  cl_connectbr_weight_ping    - score weight for ping (default 1.0)
   cl_connectbr_verbose        - 0=quiet 1=normal 2=debug (default 1)
 */
 
@@ -27,17 +26,17 @@ CVars:
 #include "EX_browser.h"
 #include "cl_connectbr.h"
 
+// cl_proxyaddr is declared in cl_main.c
+extern cvar_t cl_proxyaddr;
+
 // --------------------------------------------
 // CVars
 // --------------------------------------------
-cvar_t cl_connectbr_test_packets  = {"cl_connectbr_test_packets",  "25",   CVAR_ARCHIVE};
 cvar_t cl_connectbr_timeout_ms    = {"cl_connectbr_timeout_ms",    "600",  CVAR_ARCHIVE};
-cvar_t cl_connectbr_packet_delay  = {"cl_connectbr_packet_delay",  "15",   CVAR_ARCHIVE};
 cvar_t cl_connectbr_ping_green    = {"cl_connectbr_ping_green",    "40",   CVAR_ARCHIVE};
 cvar_t cl_connectbr_ping_yellow   = {"cl_connectbr_ping_yellow",   "80",   CVAR_ARCHIVE};
 cvar_t cl_connectbr_ping_orange   = {"cl_connectbr_ping_orange",   "200",  CVAR_ARCHIVE};
-cvar_t cl_connectbr_weight_ping   = {"cl_connectbr_weight_ping",   "0.6",  CVAR_ARCHIVE};
-cvar_t cl_connectbr_weight_loss   = {"cl_connectbr_weight_loss",   "0.4",  CVAR_ARCHIVE};
+cvar_t cl_connectbr_weight_ping   = {"cl_connectbr_weight_ping",   "1.0",  CVAR_ARCHIVE};
 cvar_t cl_connectbr_verbose       = {"cl_connectbr_verbose",       "1",    CVAR_ARCHIVE};
 cvar_t cl_connectbr_debug         = {"cl_connectbr_debug",         "0",    CVAR_ARCHIVE};
 
@@ -60,7 +59,6 @@ typedef struct {
 	char    proxylist[MAX_PROXYLIST];
 	char    label[128];
 	float   ping_ms;
-	float   loss_pct;
 	float   score;
 	qbool   via_proxy;
 	qbool   valid;
@@ -81,7 +79,7 @@ typedef struct {
 	netadr_t  addr;
 	char      ip_str[64];
 	char      name[128];
-	int       you_ms;       /* you -> this proxy (from browser or measured) */
+	int       you_ms;       /* you -> this proxy (from browser) */
 	socket_t  sock;
 	qbool     replied;
 	ps_reply_t ps;
@@ -157,7 +155,6 @@ static int CL_BR_GetBrowserPing(const netadr_t *dest)
 
 // --------------------------------------------
 // Parse a raw pingstatus reply buffer.
-// Fills ps->entries[] and ps->dest_ping.
 // --------------------------------------------
 static void CL_BR_ParsePingstatus(const byte *buf, int len,
                                    const netadr_t *dest, ps_reply_t *ps)
@@ -196,98 +193,25 @@ static void CL_BR_ParsePingstatus(const byte *buf, int len,
 }
 
 // --------------------------------------------
-// Batch A2A_PING -- sends to all proxies at once,
-// collects responses in one select() loop.
-// Sets proxy->you_ms for each that responds.
-// Total blocking time = timeout_ms, not N * timeout.
-// --------------------------------------------
-static void CL_BR_BatchPing(proxy_t *proxies, int count, int timeout_ms)
-{
-	char   packet[] = "\xff\xff\xff\xffk\n";
-	double t_send, deadline;
-	struct timeval tv;
-	int    i;
-
-	if (timeout_ms <= 0) timeout_ms = 300;
-
-	/* open sockets and send all pings */
-	t_send = Sys_DoubleTime();
-	for (i = 0; i < count; i++) {
-		struct sockaddr_storage addr_to;
-		proxies[i].sock   = UDP_OpenSocket(PORT_ANY);
-		proxies[i].you_ms = -1;
-		if (proxies[i].sock == INVALID_SOCKET) continue;
-		NetadrToSockadr(&proxies[i].addr, &addr_to);
-		sendto(proxies[i].sock, packet, strlen(packet), 0,
-		       (struct sockaddr *)&addr_to, sizeof(struct sockaddr));
-	}
-
-	deadline = t_send + timeout_ms / 1000.0;
-
-	while (Sys_DoubleTime() < deadline) {
-		fd_set fd;
-		int    maxsock = 0;
-		qbool  any     = false;
-		double now;
-
-		FD_ZERO(&fd);
-		for (i = 0; i < count; i++) {
-			if (proxies[i].sock != INVALID_SOCKET && proxies[i].you_ms < 0) {
-				FD_SET(proxies[i].sock, &fd);
-				if ((int)proxies[i].sock > maxsock) maxsock = (int)proxies[i].sock;
-				any = true;
-			}
-		}
-		if (!any) break;
-
-		tv.tv_sec = 0; tv.tv_usec = 20000;
-		if (select(maxsock + 1, &fd, NULL, NULL, &tv) <= 0) continue;
-
-		now = Sys_DoubleTime();
-		for (i = 0; i < count; i++) {
-			if (proxies[i].sock != INVALID_SOCKET && proxies[i].you_ms < 0
-			    && FD_ISSET(proxies[i].sock, &fd)) {
-				char buf[8];
-				struct sockaddr_storage from;
-				socklen_t from_len = sizeof(from);
-				int ret = recvfrom(proxies[i].sock, buf, sizeof(buf), 0,
-				                   (struct sockaddr *)&from, &from_len);
-				if (ret > 0 && buf[0] == 'l') {
-					int ms = (int)((now - t_send) * 1000.0);
-					proxies[i].you_ms = (ms < 1) ? 1 : ms;
-				}
-			}
-		}
-	}
-
-	for (i = 0; i < count; i++) {
-		if (proxies[i].sock != INVALID_SOCKET) {
-			closesocket(proxies[i].sock);
-			proxies[i].sock = INVALID_SOCKET;
-		}
-	}
-}
-
-// --------------------------------------------
 // Batch pingstatus -- sends to all proxies at once,
-// collects pingstatus replies in one select() loop.
-// Total blocking time = timeout_ms, not N * timeout.
+// collects replies in one select() loop.
+// Total blocking time = timeout_ms, regardless of proxy count.
 // --------------------------------------------
 static void CL_BR_BatchPingstatus(proxy_t *proxies, int count,
                                    const netadr_t *dest, int timeout_ms)
 {
-	char   packet[] = "\xff\xff\xff\xffpingstatus";
-	double deadline;
+	const char packet[] = "\xff\xff\xff\xffpingstatus";
+	double     deadline;
 	struct timeval tv;
-	int    i;
+	int i;
 
 	if (timeout_ms <= 0) timeout_ms = 600;
 
-	/* open sockets and send all queries */
+	/* open one socket per proxy and send all queries at once */
 	for (i = 0; i < count; i++) {
 		struct sockaddr_storage addr_to;
-		proxies[i].replied    = false;
-		proxies[i].ps.count   = 0;
+		proxies[i].replied      = false;
+		proxies[i].ps.count     = 0;
 		proxies[i].ps.dest_ping = -1;
 		proxies[i].sock = UDP_OpenSocket(PORT_ANY);
 		if (proxies[i].sock == INVALID_SOCKET) continue;
@@ -298,6 +222,7 @@ static void CL_BR_BatchPingstatus(proxy_t *proxies, int count,
 
 	deadline = Sys_DoubleTime() + timeout_ms / 1000.0;
 
+	/* collect all replies until timeout */
 	while (Sys_DoubleTime() < deadline) {
 		fd_set fd;
 		int    maxsock = 0;
@@ -307,7 +232,8 @@ static void CL_BR_BatchPingstatus(proxy_t *proxies, int count,
 		for (i = 0; i < count; i++) {
 			if (!proxies[i].replied && proxies[i].sock != INVALID_SOCKET) {
 				FD_SET(proxies[i].sock, &fd);
-				if ((int)proxies[i].sock > maxsock) maxsock = (int)proxies[i].sock;
+				if ((int)proxies[i].sock > maxsock)
+					maxsock = (int)proxies[i].sock;
 				any = true;
 			}
 		}
@@ -343,13 +269,11 @@ static void CL_BR_BatchPingstatus(proxy_t *proxies, int count,
 // --------------------------------------------
 // Score -- lower is better.
 // --------------------------------------------
-static float CL_BR_Score(float ping_ms, float loss_pct, qbool via_proxy)
+static float CL_BR_Score(float ping_ms)
 {
-	float o       = cl_connectbr_ping_orange.value > 0 ? cl_connectbr_ping_orange.value : 200.0f;
-	float w_ping  = cl_connectbr_weight_ping.value > 0 ? cl_connectbr_weight_ping.value : 0.6f;
-	float w_loss  = cl_connectbr_weight_loss.value > 0 ? cl_connectbr_weight_loss.value : 0.4f;
-	(void)via_proxy;
-	return w_ping * (ping_ms / (o * 2.0f)) + w_loss * (loss_pct / 100.0f);
+	float o      = cl_connectbr_ping_orange.value > 0 ? cl_connectbr_ping_orange.value : 200.0f;
+	float w_ping = cl_connectbr_weight_ping.value  > 0 ? cl_connectbr_weight_ping.value  : 1.0f;
+	return w_ping * (ping_ms / (o * 2.0f));
 }
 
 static int CL_BR_RouteCompare(const void *a, const void *b)
@@ -362,21 +286,29 @@ static int CL_BR_RouteCompare(const void *a, const void *b)
 }
 
 // --------------------------------------------
-// Add a route (dedup by proxylist string)
+// Add a route (dedup by proxylist string).
+// Rejects if proxylist would be truncated.
 // --------------------------------------------
 static void CL_BR_AddRoute(const char *proxylist, const char *label,
                             float ping_ms, qbool via_proxy)
 {
 	int i;
+
 	if (br_route_count >= CONNECTBR_MAX_ROUTES) return;
+
+	if (strlen(proxylist) >= MAX_PROXYLIST) {
+		BR_Debug("route '%s' skipped: proxylist too long (%d chars)\n",
+		         label, (int)strlen(proxylist));
+		return;
+	}
+
 	for (i = 0; i < br_route_count; i++)
 		if (strcmp(br_routes[i].proxylist, proxylist) == 0) return;
 
 	strlcpy(br_routes[br_route_count].proxylist, proxylist, MAX_PROXYLIST);
 	strlcpy(br_routes[br_route_count].label,     label,     sizeof(br_routes[0].label));
 	br_routes[br_route_count].ping_ms   = ping_ms;
-	br_routes[br_route_count].loss_pct  = 0;
-	br_routes[br_route_count].score     = CL_BR_Score(ping_ms, 0, via_proxy);
+	br_routes[br_route_count].score     = CL_BR_Score(ping_ms);
 	br_routes[br_route_count].via_proxy = via_proxy;
 	br_routes[br_route_count].valid     = true;
 	br_route_count++;
@@ -387,7 +319,6 @@ static void CL_BR_AddRoute(const char *proxylist, const char *label,
 // --------------------------------------------
 static void CL_BR_ApplyRoute(int idx)
 {
-	extern cvar_t cl_proxyaddr;
 	route_t *r = &br_routes[idx];
 
 	Cvar_Set(&cl_proxyaddr, "");
@@ -395,9 +326,8 @@ static void CL_BR_ApplyRoute(int idx)
 		Cvar_Set(&cl_proxyaddr, r->proxylist);
 
 	Com_Printf("\n&cf80connectbr:&r route #%d - %s\n", idx + 1, r->label);
-	Com_Printf("  ping: %s%.0fms&r  loss: %s%.0f%%&r\n",
-	           CL_BR_PingColor(r->ping_ms), r->ping_ms,
-	           CL_BR_LossColor(r->loss_pct), r->loss_pct);
+	Com_Printf("  ping: %s%.0fms&r\n",
+	           CL_BR_PingColor(r->ping_ms), r->ping_ms);
 
 	if (idx + 1 < br_route_count)
 		Com_Printf("  type &cf80connectnext&r for route #%d (%s)\n",
@@ -413,18 +343,14 @@ static void CL_BR_ApplyRoute(int idx)
 // --------------------------------------------
 void CL_Connect_BestRoute_f(void)
 {
-	extern cvar_t cl_proxyaddr;
 	const char *addr;
 	int i, j;
 	int timeout_ms;
 	int verbose;
 
-	/* P1 proxy array (heap) */
-	proxy_t *p1 = NULL;
+	proxy_t *p1       = NULL;
 	int      p1_count = 0;
-
-	/* P2 proxy array (heap) for 2-hop */
-	proxy_t *p2 = NULL;
+	proxy_t *p2       = NULL;
 	int      p2_count = 0;
 
 	if (br_measuring) {
@@ -440,8 +366,8 @@ void CL_Connect_BestRoute_f(void)
 	}
 
 	addr = Cmd_Argv(1);
-	if (!addr || !*addr) { Com_Printf("connectbr: empty address\n"); return; }
-	if (strlen(addr) > MAX_ADDRESS_LENGTH) { Com_Printf("connectbr: address too long\n"); return; }
+	if (!addr || !*addr)                    { Com_Printf("connectbr: empty address\n");    return; }
+	if (strlen(addr) > MAX_ADDRESS_LENGTH)  { Com_Printf("connectbr: address too long\n"); return; }
 
 	if (!NET_StringToAdr(addr, &br_target_addr)) {
 		Com_Printf("connectbr: invalid address '%s'\n", addr);
@@ -483,25 +409,25 @@ void CL_Connect_BestRoute_f(void)
 			                               sizeof(proxy_str), &total_ping_ms)
 			    && proxy_str[0] && strcmp(proxy_str, target_str) != 0) {
 				float ping = (total_ping_ms > 0) ? (float)total_ping_ms : 1.0f;
-				char lbl[128];
+				char  lbl[128];
 				snprintf(lbl, sizeof(lbl), "ping tree (%d hop%s)",
 				         pathlen, pathlen > 1 ? "s" : "");
 				CL_BR_AddRoute(proxy_str, lbl, ping, true);
-				if (verbose >= 2)
-					Com_Printf("  [ping tree %d hop(s)] %s%.0fms&r\n",
-					           pathlen, CL_BR_PingColor(ping), ping);
 			}
 		}
 	}
 
 	// ══════════════════════════════════════════════════════════════════
-	// Step 2: collect P1 proxy candidates
+	// Step 2: collect P1 proxy candidates from server browser
 	// ══════════════════════════════════════════════════════════════════
 	p1 = (proxy_t *)Q_malloc(CONNECTBR_MAX_PROXIES * sizeof(proxy_t));
-	if (!p1) goto done;
+	if (!p1) {
+		/* allocation failed -- skip proxy testing, still try direct */
+		Com_Printf("connectbr: failed to allocate proxy list.\n");
+		goto step_direct;
+	}
 	memset(p1, 0, CONNECTBR_MAX_PROXIES * sizeof(proxy_t));
 
-	/* from server browser (port 30000 only) */
 	SB_ServerList_Lock();
 	for (i = 0; i < serversn && p1_count < CONNECTBR_MAX_PROXIES; i++) {
 		server_data *s = servers[i];
@@ -513,17 +439,14 @@ void CL_Connect_BestRoute_f(void)
 		if (dup) continue;
 		p1[p1_count].addr   = s->address;
 		p1[p1_count].you_ms = s->ping;
+		p1[p1_count].sock   = INVALID_SOCKET;
 		CL_BR_AdrToStr(&s->address, p1[p1_count].ip_str, sizeof(p1[0].ip_str));
 		strlcpy(p1[p1_count].name,
 		        s->display.name[0] ? s->display.name : p1[p1_count].ip_str,
 		        sizeof(p1[0].name));
-		p1[p1_count].sock = INVALID_SOCKET;
 		p1_count++;
 	}
 	SB_ServerList_Unlock();
-
-	if (verbose >= 1)
-		Com_Printf("  Testing %d proxies...\n", p1_count);
 
 	if (p1_count == 0) {
 		if (verbose >= 1)
@@ -531,8 +454,11 @@ void CL_Connect_BestRoute_f(void)
 		goto step_direct;
 	}
 
+	if (verbose >= 1)
+		Com_Printf("  Testing %d prox%s...\n", p1_count, p1_count == 1 ? "y" : "ies");
+
 	// ══════════════════════════════════════════════════════════════════
-	// Step 3: batch pingstatus to all P1s (single timeout window)
+	// Step 3: batch pingstatus to all P1s (one timeout window total)
 	// ══════════════════════════════════════════════════════════════════
 	CL_BR_BatchPingstatus(p1, p1_count, &br_target_addr, timeout_ms);
 
@@ -540,37 +466,36 @@ void CL_Connect_BestRoute_f(void)
 	// Step 4: collect P2 candidates from P1 replies, batch query them
 	// ══════════════════════════════════════════════════════════════════
 	p2 = (proxy_t *)Q_malloc(CONNECTBR_MAX_PROXIES * sizeof(proxy_t));
-	if (!p2) goto build_routes;
+	if (!p2) goto build_routes;  /* p2==NULL is handled safely below */
 	memset(p2, 0, CONNECTBR_MAX_PROXIES * sizeof(proxy_t));
 
 	for (i = 0; i < p1_count; i++) {
 		if (!p1[i].replied) continue;
-		for (j = 0; j < p1[i].ps.count; j++) {
+		for (j = 0; j < p1[i].ps.count && p2_count < CONNECTBR_MAX_PROXIES; j++) {
 			ps_entry_t *nb = &p1[i].ps.entries[j];
 			int k; qbool dup = false;
 
-			if (ntohs(nb->addr.port) != 30000)         continue;
-			if (CL_BR_IsTarget(&nb->addr))             continue;
-			if (CL_BR_AdrEqual(&nb->addr, &p1[i].addr)) continue;
+			if (ntohs(nb->addr.port) != 30000)           continue;
+			if (CL_BR_IsTarget(&nb->addr))               continue;
+			if (CL_BR_AdrEqual(&nb->addr, &p1[i].addr))  continue;
 			if (nb->addr.ip[0] == 0 && nb->addr.ip[1] == 0 &&
 			    nb->addr.ip[2] == 0 && nb->addr.ip[3] == 0) continue;
 
 			for (k = 0; k < p2_count && !dup; k++)
 				if (CL_BR_AdrEqual(&p2[k].addr, &nb->addr)) dup = true;
 			if (dup) continue;
-			if (p2_count >= CONNECTBR_MAX_PROXIES) break;
 
-			p2[p2_count].addr = nb->addr;
-			CL_BR_AdrToStr(&nb->addr, p2[p2_count].ip_str, sizeof(p2[0].ip_str));
-			strlcpy(p2[p2_count].name, p2[p2_count].ip_str, sizeof(p2[0].name));
+			p2[p2_count].addr   = nb->addr;
 			p2[p2_count].you_ms = -1;
 			p2[p2_count].sock   = INVALID_SOCKET;
+			CL_BR_AdrToStr(&nb->addr, p2[p2_count].ip_str, sizeof(p2[0].ip_str));
+			strlcpy(p2[p2_count].name, p2[p2_count].ip_str, sizeof(p2[0].name));
 			p2_count++;
 		}
 	}
 
 	if (p2_count > 0) {
-		BR_Debug("  Found %d P2 candidates for 2-hop\n", p2_count);
+		BR_Debug("  %d P2 candidate(s) for 2-hop\n", p2_count);
 		CL_BR_BatchPingstatus(p2, p2_count, &br_target_addr, timeout_ms);
 	}
 
@@ -581,39 +506,36 @@ build_routes:
 	for (i = 0; i < p1_count; i++) {
 		char lbl[128];
 
-		if (!p1[i].replied) continue;  /* no pingstatus reply -- skip */
+		if (!p1[i].replied) continue;
 
-		/* ── 1-hop: you -> P1 -> dest ── */
+		/* 1-hop: you -> P1 -> dest */
 		if (p1[i].ps.dest_ping >= 0) {
 			int total = p1[i].you_ms + p1[i].ps.dest_ping;
 			snprintf(lbl, sizeof(lbl), "via %s [1 hop]", p1[i].name);
 			CL_BR_AddRoute(p1[i].ip_str, lbl, (float)total, true);
 			if (verbose >= 2)
-				Com_Printf("  [%s] %s%dms&r  (you->P1 %dms + P1->dest %dms)\n",
+				Com_Printf("  [%s] %s%dms&r  (you %dms + proxy->dest %dms)\n",
 				           p1[i].name, CL_BR_PingColor((float)total), total,
 				           p1[i].you_ms, p1[i].ps.dest_ping);
 		}
 
-		/* ── 2-hop: you -> P1 -> P2 -> dest ── */
+		/* 2-hop: you -> P1 -> P2 -> dest */
 		if (!p2) continue;
 		for (j = 0; j < p1[i].ps.count; j++) {
 			ps_entry_t *nb = &p1[i].ps.entries[j];
-			int k, ping_p1_p2, ping_p2_dest, total2;
+			int k, total2;
 			char proxylist[MAX_PROXYLIST];
 
 			if (ntohs(nb->addr.port) != 30000)           continue;
 			if (CL_BR_IsTarget(&nb->addr))               continue;
 			if (CL_BR_AdrEqual(&nb->addr, &p1[i].addr))  continue;
 
-			/* find this P2 in our batch results */
 			for (k = 0; k < p2_count; k++)
 				if (CL_BR_AdrEqual(&p2[k].addr, &nb->addr)) break;
 			if (k >= p2_count || !p2[k].replied) continue;
 			if (p2[k].ps.dest_ping < 0)          continue;
 
-			ping_p1_p2   = nb->dist_ms;
-			ping_p2_dest = p2[k].ps.dest_ping;
-			total2       = p1[i].you_ms + ping_p1_p2 + ping_p2_dest;
+			total2 = p1[i].you_ms + nb->dist_ms + p2[k].ps.dest_ping;
 
 			snprintf(proxylist, sizeof(proxylist), "%s@%s",
 			         p1[i].ip_str, p2[k].ip_str);
@@ -623,11 +545,10 @@ build_routes:
 
 			if (verbose >= 1)
 				Com_Printf("  [%s -> %s] %s%dms&r  "
-				           "(you->P1 %dms + P1->P2 %dms + P2->dest %dms) "
-				           "&cf802 hops&r\n",
+				           "(you %dms + P1->P2 %dms + P2->dest %dms) &cf802 hops&r\n",
 				           p1[i].name, p2[k].ip_str,
 				           CL_BR_PingColor((float)total2), total2,
-				           p1[i].you_ms, ping_p1_p2, ping_p2_dest);
+				           p1[i].you_ms, nb->dist_ms, p2[k].ps.dest_ping);
 		}
 	}
 
@@ -644,7 +565,6 @@ step_direct:
 		}
 	}
 
-done:
 	Q_free(p1);
 	Q_free(p2);
 	br_measuring = false;
@@ -656,7 +576,7 @@ done:
 
 	qsort(br_routes, br_route_count, sizeof(route_t), CL_BR_RouteCompare);
 
-	/* remove unplayable routes */
+	/* remove unplayable routes (above orange threshold) */
 	{
 		int max_ping = (int)cl_connectbr_ping_orange.value;
 		int usable   = 0;
@@ -671,19 +591,18 @@ done:
 	}
 
 	if (br_route_count == 0) {
-		Com_Printf("connectbr: all routes above %dms -- unplayable.\n",
-		           (int)cl_connectbr_ping_orange.value > 0 ?
-		           (int)cl_connectbr_ping_orange.value : 200);
+		int max_ping = (int)cl_connectbr_ping_orange.value;
+		if (max_ping <= 0) max_ping = 200;
+		Com_Printf("connectbr: all routes above %dms -- unplayable.\n", max_ping);
 		return;
 	}
 
 	if (verbose >= 1) {
 		Com_Printf("\n&cf80--- route ranking ---&r\n");
 		for (i = 0; i < br_route_count; i++) {
-			Com_Printf("  #%d %s\n     ping=%s%.0fms&r  loss=%s%.0f%%&r\n",
+			Com_Printf("  #%d %s\n     ping=%s%.0fms&r\n",
 			           i + 1, br_routes[i].label,
-			           CL_BR_PingColor(br_routes[i].ping_ms), br_routes[i].ping_ms,
-			           CL_BR_LossColor(br_routes[i].loss_pct), br_routes[i].loss_pct);
+			           CL_BR_PingColor(br_routes[i].ping_ms), br_routes[i].ping_ms);
 		}
 	}
 
@@ -721,14 +640,11 @@ void CL_Connect_Next_f(void)
 void CL_ConnectBR_Init(void)
 {
 	Cvar_SetCurrentGroup(CVAR_GROUP_NETWORK);
-	Cvar_Register(&cl_connectbr_test_packets);
 	Cvar_Register(&cl_connectbr_timeout_ms);
-	Cvar_Register(&cl_connectbr_packet_delay);
 	Cvar_Register(&cl_connectbr_ping_green);
 	Cvar_Register(&cl_connectbr_ping_yellow);
 	Cvar_Register(&cl_connectbr_ping_orange);
 	Cvar_Register(&cl_connectbr_weight_ping);
-	Cvar_Register(&cl_connectbr_weight_loss);
 	Cvar_Register(&cl_connectbr_verbose);
 	Cvar_Register(&cl_connectbr_debug);
 	Cvar_ResetCurrentGroup();
