@@ -104,7 +104,8 @@ static int       br_current_route = 0;
 static netadr_t  br_target_addr;
 static qbool     br_active        = false;
 static qbool     br_measuring     = false;
-static char      br_ranking_buf[4096];  /* ranking pre-formatado, impresso na thread principal */
+static qbool     br_done          = false;
+static char      br_ranking_buf[4096];
 
 // --------------------------------------------
 // Colour helpers
@@ -494,10 +495,6 @@ static void CL_BR_ApplyRoute(int idx)
 {
 	route_t *r = &br_routes[idx];
 
-	/* Imprime ranking completo apenas na primeira rota (thread principal = seguro) */
-	if (idx == 0 && br_ranking_buf[0])
-		Com_Printf("%s", br_ranking_buf);
-
 	Cvar_Set(&cl_proxyaddr, "");
 	if (r->proxylist[0])
 		Cvar_Set(&cl_proxyaddr, r->proxylist);
@@ -762,7 +759,8 @@ step_direct:
 	if (br_route_count > 10)
 		br_route_count = 10;
 
-	if (verbose >= 1) {
+	/* Monta ranking no buffer -- sera impresso pela thread principal em CL_ConnectBR_Frame */
+	{
 		int  show = (br_route_count < 6) ? br_route_count : 6;
 		char tmp[256];
 		br_ranking_buf[0] = '\0';
@@ -776,13 +774,11 @@ step_direct:
 			         br_routes[i].label);
 			strlcat(br_ranking_buf, tmp, sizeof(br_ranking_buf));
 		}
-	} else {
-		br_ranking_buf[0] = '\0';
 	}
 
 	br_current_route = 0;
 	br_active        = true;
-	CL_BR_ApplyRoute(0);
+	br_done          = true;   /* sinaliza thread principal para imprimir e conectar */
 	return 0;
 }
 
@@ -827,6 +823,8 @@ void CL_Connect_BestRoute_f(void)
 	br_route_count   = 0;
 	br_current_route = 0;
 	br_active        = false;
+	br_done          = false;
+	br_ranking_buf[0] = '\0';
 	Cvar_Set(&cl_proxyaddr, "");
 
 	if ((int)cl_connectbr_verbose.value >= 1)
@@ -859,6 +857,27 @@ void CL_Connect_Next_f(void)
 
 	Host_EndGame();
 	CL_BR_ApplyRoute(br_current_route);
+}
+
+// --------------------------------------------
+// PUBLIC: CL_ConnectBR_Frame
+// Chamada pela thread principal a cada frame.
+// Verifica se a thread de medicao terminou e,
+// se sim, imprime o ranking e conecta -- tudo
+// na thread principal, sem race condition.
+// --------------------------------------------
+void CL_ConnectBR_Frame(void)
+{
+	if (!br_done) return;
+	br_done = false;
+
+	if (br_route_count == 0) return;
+
+	/* Imprime ranking aqui -- thread principal, Com_Printf seguro */
+	if (br_ranking_buf[0])
+		Com_Printf("%s", br_ranking_buf);
+
+	CL_BR_ApplyRoute(0);
 }
 
 // --------------------------------------------
