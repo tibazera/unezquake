@@ -298,10 +298,10 @@ void SB_PingTree_ConnectBestPath(const netadr_t *addr);
 int SB_PingTree_GetPathLen(const netadr_t *addr);
 void SB_Proxylist_Unserialize_f(void);
 
-// Returns the proxy chain string for the best path to addr WITHOUT
-// modifying cl_proxyaddr or issuing any connect command.
-// out receives "proxy1:port" or "proxy1:port@proxy2:port" etc.
+// Returns the proxy chain string for the best path to addr WITHOUT connecting.
+// out receives "proxy1ip:port" or "proxy1ip:port@proxy2ip:port" (outermost first).
 // Returns true if a proxy route was found, false if direct is best or no route.
+// out_total_ping_ms receives the Dijkstra distance in ms (may be 0 -- check it).
 qbool SB_PingTree_GetProxyString(const netadr_t *addr, char *out, size_t outsz,
                                   int *out_total_ping_ms);
 
