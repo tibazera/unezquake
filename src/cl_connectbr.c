@@ -112,13 +112,6 @@ static const char *CL_BR_PingColor(float ms)
 	return "&cf00";
 }
 
-static const char *CL_BR_LossColor(float pct)
-{
-	if (pct <= 0) return "&c0f0";
-	if (pct <= 5) return "&cff0";
-	return "&cf00";
-}
-
 // --------------------------------------------
 // Helpers
 // --------------------------------------------
