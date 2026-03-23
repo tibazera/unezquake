@@ -625,9 +625,11 @@ static int CL_BR_MeasureProc(void *ignored)
 
 	for (i = 0; i < p1_count; i++) {
 		if (!p1[i].replied) continue;
-		for (j = 0; j < p1[i].ps.count && p2_count < CONNECTBR_MAX_PROXIES; j++) {
+		for (j = 0; j < p1[i].ps.count; j++) {
 			ps_entry_t *nb = &p1[i].ps.entries[j];
 			int k; qbool dup = false;
+
+			if (p2_count >= CONNECTBR_MAX_PROXIES) break;
 
 			if (ntohs(nb->addr.port) != 30000)           continue;
 			if (CL_BR_IsTarget(&nb->addr))               continue;
@@ -677,14 +679,15 @@ build_routes:
 				snprintf(lbl, sizeof(lbl), "via %s [1 hop%s]",
 				         p1[i].name, estimated ? " ~est" : "");
 				CL_BR_AddRoute(p1[i].ip_str, lbl, (float)total, p1[i].loss_pct, true);
-				if (verbose >= 2)
+				if (verbose >= 1)
 					Com_Printf("  [%s] %s%dms&r loss=%.0f%% (you %dms + proxy->dest %dms%s)\n",
 					           p1[i].name, CL_BR_PingColor((float)total), total,
 					           p1[i].loss_pct, p1[i].you_ms, p1_dest_ping,
 					           estimated ? " ~est" : "");
 			}
 
-			/* 2-hop: so usa P1 se voce->P1 < ping direto */
+			/* 2-hop: so usa P1 como intermediario se voce->P1 < ping direto.
+			 * Se nao temos ping direto (direct_ping==-1), nao filtra -- tenta tudo. */
 			if (!p2) continue;
 			if (direct_ping > 0 && p1[i].you_ms >= direct_ping) continue;
 
@@ -734,7 +737,7 @@ step_direct:
 	{
 		int dp = CL_BR_GetBrowserPing(&br_target_addr);
 		if (dp > 0) {
-			if (verbose >= 2)
+			if (verbose >= 1)
 				Com_Printf("  [direct] %s%dms&r\n", CL_BR_PingColor((float)dp), dp);
 			CL_BR_AddRoute("", "direct", (float)dp, 0.0f, false);
 		}
@@ -755,8 +758,9 @@ step_direct:
 		br_route_count = 10;
 
 	if (verbose >= 1) {
-		Com_Printf("\n&cf80--- route ranking ---&r\n");
-		for (i = 0; i < br_route_count; i++) {
+		int show = (br_route_count < 6) ? br_route_count : 6;
+		Com_Printf("\n&cf80--- route ranking (top %d) ---&r\n", show);
+		for (i = 0; i < show; i++) {
 			Com_Printf("  #%d %s\n     ping=%s%.0fms&r  loss=%s%.1f%%&r\n",
 			           i + 1, br_routes[i].label,
 			           CL_BR_PingColor(br_routes[i].ping_ms), br_routes[i].ping_ms,
