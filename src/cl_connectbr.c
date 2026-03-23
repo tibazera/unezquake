@@ -205,184 +205,66 @@ static void CL_BR_ParsePingstatus(const byte *buf, int len,
 }
 
 // --------------------------------------------
-// Batch A2A_PING -- sends A2A_PING to all proxies with you_ms==-1,
-// measures RTT in one select() loop. Non-blocking: total wait = timeout_ms.
-// --------------------------------------------
-static void CL_BR_BatchA2APing(proxy_t *proxies, int count, int timeout_ms)
-{
-	const char packet[] = "\xff\xff\xff\xffk\n";
-	double     t_send, deadline;
-	struct timeval tv;
-	int i;
-
-	if (timeout_ms <= 0) timeout_ms = 600;
-
-	t_send = Sys_DoubleTime();
-
-	for (i = 0; i < count; i++) {
-		struct sockaddr_storage addr_to;
-		if (proxies[i].you_ms >= 0) { proxies[i].sock = INVALID_SOCKET; continue; }
-		proxies[i].sock = UDP_OpenSocket(PORT_ANY);
-		if (proxies[i].sock == INVALID_SOCKET) continue;
-		NetadrToSockadr(&proxies[i].addr, &addr_to);
-		sendto(proxies[i].sock, packet, strlen(packet), 0,
-		       (struct sockaddr *)&addr_to, sizeof(struct sockaddr));
-	}
-
-	deadline = t_send + timeout_ms / 1000.0;
-
-	while (Sys_DoubleTime() < deadline) {
-		fd_set fd;
-		int    maxsock = 0;
-		qbool  any = false;
-		double now;
-
-		FD_ZERO(&fd);
-		for (i = 0; i < count; i++) {
-			if (proxies[i].you_ms < 0 && proxies[i].sock != INVALID_SOCKET) {
-				FD_SET(proxies[i].sock, &fd);
-				if ((int)proxies[i].sock > maxsock) maxsock = (int)proxies[i].sock;
-				any = true;
-			}
-		}
-		if (!any) break;
-
-		tv.tv_sec = 0; tv.tv_usec = 20000;
-		if (select(maxsock + 1, &fd, NULL, NULL, &tv) <= 0) continue;
-
-		now = Sys_DoubleTime();
-		for (i = 0; i < count; i++) {
-			if (proxies[i].you_ms < 0 && proxies[i].sock != INVALID_SOCKET
-			    && FD_ISSET(proxies[i].sock, &fd)) {
-				char buf[8];
-				struct sockaddr_storage from;
-				socklen_t from_len = sizeof(from);
-				int ret = recvfrom(proxies[i].sock, buf, sizeof(buf), 0,
-				                   (struct sockaddr *)&from, &from_len);
-				if (ret > 0 && buf[0] == 'l') {
-					int ms = (int)((now - t_send) * 1000.0);
-					proxies[i].you_ms = (ms < 1) ? 1 : ms;
-				}
-			}
-		}
-	}
-
-	for (i = 0; i < count; i++) {
-		if (proxies[i].sock != INVALID_SOCKET) {
-			closesocket(proxies[i].sock);
-			proxies[i].sock = INVALID_SOCKET;
-		}
-	}
-}
-
-// --------------------------------------------
-// Batch pingstatus -- sends multiple packets to each proxy,
-// counts responses to compute loss.
+// Batch pingstatus -- sends to all proxies simultaneously,
+// measures you->proxy RTT from the first reply timing,
+// counts multiple replies to compute loss.
 // Total blocking time = timeout_ms, regardless of proxy count.
 // --------------------------------------------
 static void CL_BR_BatchPingstatus(proxy_t *proxies, int count,
                                    const netadr_t *dest, int timeout_ms)
 {
-	const char *packet = "\xff\xff\xff\xffpingstatus";
-	int packet_count = (int)cl_connectbr_test_packets.value;
-	int i, pkt;
-	double deadline;
+	const char *packet      = "\xff\xff\xff\xffpingstatus";
+	int         packet_count = (int)cl_connectbr_test_packets.value;
+	double     *send_times;
+	int        *recv_count;
+	int         i, pkt;
+	double      deadline;
 	struct timeval tv;
 
-	if (packet_count <= 0) packet_count = 1;
-	if (timeout_ms <= 0) timeout_ms = 600;
+	if (packet_count < 1)  packet_count = 1;
+	if (packet_count > 20) packet_count = 20;
+	if (timeout_ms <= 0)   timeout_ms   = 600;
 
-	// Open sockets and send packets (multiple per proxy)
+	send_times = (double *)Q_malloc(count * sizeof(double));
+	recv_count = (int    *)Q_malloc(count * sizeof(int));
+	if (!send_times || !recv_count) {
+		Q_free(send_times);
+		Q_free(recv_count);
+		return;
+	}
+	memset(recv_count, 0, count * sizeof(int));
+
+	/* open one socket per proxy, record send time, send all packets */
 	for (i = 0; i < count; i++) {
 		struct sockaddr_storage addr_to;
-		proxies[i].replied = false;
-		proxies[i].loss_pct = 100.0f;  // default high loss
-		proxies[i].ps.count = 0;
+		proxies[i].replied      = false;
+		proxies[i].loss_pct     = 100.0f;
+		proxies[i].ps.count     = 0;
 		proxies[i].ps.dest_ping = -1;
+		send_times[i]           = 0;
+
 		proxies[i].sock = UDP_OpenSocket(PORT_ANY);
 		if (proxies[i].sock == INVALID_SOCKET) continue;
 
 		NetadrToSockadr(&proxies[i].addr, &addr_to);
+		send_times[i] = Sys_DoubleTime();
 		for (pkt = 0; pkt < packet_count; pkt++) {
 			sendto(proxies[i].sock, packet, strlen(packet), 0,
 			       (struct sockaddr *)&addr_to, sizeof(struct sockaddr));
-			// Optionally add a small delay if needed (commented out)
-			// if (cl_connectbr_packet_delay.value > 0 && pkt < packet_count-1)
-			//     Sys_Sleep(cl_connectbr_packet_delay.value);
 		}
 	}
-
-	// Count responses per proxy
-	int *recv_count = (int *)Q_malloc(count * sizeof(int));
-	if (!recv_count) {
-		// If allocation fails, fallback to simple mode: treat as one packet
-		packet_count = 1;
-		for (i = 0; i < count; i++) {
-			if (proxies[i].sock != INVALID_SOCKET) {
-				closesocket(proxies[i].sock);
-				proxies[i].sock = INVALID_SOCKET;
-			}
-		}
-		// Reopen and send single packet
-		for (i = 0; i < count; i++) {
-			struct sockaddr_storage addr_to;
-			proxies[i].replied = false;
-			proxies[i].loss_pct = 100.0f;
-			proxies[i].ps.count = 0;
-			proxies[i].ps.dest_ping = -1;
-			proxies[i].sock = UDP_OpenSocket(PORT_ANY);
-			if (proxies[i].sock == INVALID_SOCKET) continue;
-			NetadrToSockadr(&proxies[i].addr, &addr_to);
-			sendto(proxies[i].sock, packet, strlen(packet), 0,
-			       (struct sockaddr *)&addr_to, sizeof(struct sockaddr));
-		}
-		// Use a simpler receive loop that just collects one reply per proxy
-		deadline = Sys_DoubleTime() + timeout_ms / 1000.0;
-		while (Sys_DoubleTime() < deadline) {
-			fd_set fd;
-			int maxsock = 0;
-			qbool any = false;
-			FD_ZERO(&fd);
-			for (i = 0; i < count; i++) {
-				if (!proxies[i].replied && proxies[i].sock != INVALID_SOCKET) {
-					FD_SET(proxies[i].sock, &fd);
-					if ((int)proxies[i].sock > maxsock) maxsock = (int)proxies[i].sock;
-					any = true;
-				}
-			}
-			if (!any) break;
-			tv.tv_sec = 0; tv.tv_usec = 20000;
-			if (select(maxsock + 1, &fd, NULL, NULL, &tv) <= 0) continue;
-			for (i = 0; i < count; i++) {
-				if (!proxies[i].replied && proxies[i].sock != INVALID_SOCKET
-				    && FD_ISSET(proxies[i].sock, &fd)) {
-					byte buf[8 * 512];
-					struct sockaddr_storage from;
-					socklen_t from_len = sizeof(from);
-					int ret = recvfrom(proxies[i].sock, (char *)buf, sizeof(buf), 0,
-					                   (struct sockaddr *)&from, &from_len);
-					if (ret > 5 && memcmp(buf, "\xff\xff\xff\xffn", 5) == 0) {
-						proxies[i].replied = true;
-						CL_BR_ParsePingstatus(buf + 5, ret - 5, dest, &proxies[i].ps);
-						proxies[i].loss_pct = 0.0f; // no loss info
-					}
-				}
-			}
-		}
-		goto cleanup;
-	}
-	memset(recv_count, 0, count * sizeof(int));
 
 	deadline = Sys_DoubleTime() + timeout_ms / 1000.0;
 
 	while (Sys_DoubleTime() < deadline) {
 		fd_set fd;
-		int maxsock = 0;
-		qbool any = false;
+		int    maxsock = 0;
+		qbool  any     = false;
 
 		FD_ZERO(&fd);
 		for (i = 0; i < count; i++) {
-			if (!proxies[i].replied && proxies[i].sock != INVALID_SOCKET) {
+			/* keep listening until we've received all expected replies or timed out */
+			if (recv_count[i] < packet_count && proxies[i].sock != INVALID_SOCKET) {
 				FD_SET(proxies[i].sock, &fd);
 				if ((int)proxies[i].sock > maxsock)
 					maxsock = (int)proxies[i].sock;
@@ -395,37 +277,44 @@ static void CL_BR_BatchPingstatus(proxy_t *proxies, int count,
 		if (select(maxsock + 1, &fd, NULL, NULL, &tv) <= 0) continue;
 
 		for (i = 0; i < count; i++) {
-			if (!proxies[i].replied && proxies[i].sock != INVALID_SOCKET
+			if (recv_count[i] < packet_count
+			    && proxies[i].sock != INVALID_SOCKET
 			    && FD_ISSET(proxies[i].sock, &fd)) {
 				byte buf[8 * 512];
 				struct sockaddr_storage from;
 				socklen_t from_len = sizeof(from);
+				double    now      = Sys_DoubleTime();
 				int ret = recvfrom(proxies[i].sock, (char *)buf, sizeof(buf), 0,
 				                   (struct sockaddr *)&from, &from_len);
 				if (ret > 5 && memcmp(buf, "\xff\xff\xff\xffn", 5) == 0) {
 					recv_count[i]++;
 					if (!proxies[i].replied) {
-						// First reply: parse pingstatus
+						/* first reply: parse pingstatus data */
 						CL_BR_ParsePingstatus(buf + 5, ret - 5, dest, &proxies[i].ps);
 						proxies[i].replied = true;
+						/* measure you->proxy RTT from pingstatus round-trip
+						   (use this only if browser didn't already have a ping) */
+						if (proxies[i].you_ms < 0 && send_times[i] > 0) {
+							int ms = (int)((now - send_times[i]) * 1000.0);
+							proxies[i].you_ms = (ms < 1) ? 1 : ms;
+						}
 					}
 				}
 			}
 		}
 	}
 
-	// Compute loss for each proxy (if any reply received)
+	/* compute packet loss for each proxy */
 	for (i = 0; i < count; i++) {
 		if (proxies[i].replied && recv_count[i] > 0) {
-			float loss = 100.0f * (1.0f - (float)recv_count[i] / packet_count);
-			if (loss < 0) loss = 0;
-			proxies[i].loss_pct = loss;
+			float loss = 100.0f * (1.0f - (float)recv_count[i] / (float)packet_count);
+			proxies[i].loss_pct = (loss < 0) ? 0 : loss;
 		}
 	}
 
+	Q_free(send_times);
 	Q_free(recv_count);
 
-cleanup:
 	for (i = 0; i < count; i++) {
 		if (proxies[i].sock != INVALID_SOCKET) {
 			closesocket(proxies[i].sock);
@@ -591,27 +480,6 @@ static int CL_BR_MeasureProc(void *ignored)
 
 	if (verbose >= 1)
 		Com_Printf("  Testing %d prox%s...\n", p1_count, p1_count == 1 ? "y" : "ies");
-
-	/* medir you->proxy para proxies que o browser ainda nao pingou */
-	CL_BR_BatchA2APing(p1, p1_count, timeout_ms);
-
-	/* remover proxies que nao responderam ao A2A ping */
-	{
-		int alive = 0;
-		for (i = 0; i < p1_count; i++) {
-			if (p1[i].you_ms >= 0) {
-				if (i != alive) p1[alive] = p1[i];
-				alive++;
-			}
-		}
-		p1_count = alive;
-	}
-
-	if (p1_count == 0) {
-		if (verbose >= 1)
-			Com_Printf("  No proxies reachable.\n");
-		goto step_direct;
-	}
 
 	// ══════════════════════════════════════════════════════════════════
 	// Step 3: pingstatus em batch para todos os P1s
