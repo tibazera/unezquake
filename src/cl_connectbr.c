@@ -278,7 +278,9 @@ static int CL_BR_GetProxyToDestPing(const netadr_t *proxy_addr,
 			const byte *p   = buf + 5;
 			const byte *end = buf + ret;
 			while (p + 8 <= end) {
-				if (memcmp(p, dest_addr->ip, 4) == 0) {
+				/* pingstatus entry: 4B IP | 2B port (net-order) | 2B ping (little-endian) */
+				if (memcmp(p, dest_addr->ip, 4) == 0 &&
+				    memcmp(p + 4, &dest_addr->port, 2) == 0) {
 					short dist;
 					memcpy(&dist, p + 6, 2);
 					dist = (short)LittleShort(dist);
@@ -401,18 +403,33 @@ void CL_Connect_BestRoute_f(void)
 	}
 
 	// ── Step 1: ping tree best route (includes real multi-hop via Dijkstra) ──
-	// SB_PingTree_GetProxyString already returns the full chain with correct
-	// total ping calculated by the ping tree's own Dijkstra -- this is the
-	// authoritative multi-hop result when the ping tree is available.
-	if (SB_PingTree_Built() && br_route_count < CONNECTBR_MAX_ROUTES - 1) {
+	// The ping tree requires sb_findroutes to be enabled and sb_buildpingtree to have run.
+	// We enable sb_findroutes temporarily if needed, but only use the tree if already built.
+	if (SB_PingTree_Built() && !SB_PingTree_IsBuilding() && br_route_count < CONNECTBR_MAX_ROUTES - 1) {
 		int pathlen = SB_PingTree_GetPathLen(&br_target_addr);
 		if (pathlen > 0) {
 			int  total_ping_ms = 0;
 			char proxy_str[MAX_PROXYLIST];
+			proxy_str[0] = '\0';
 			if (SB_PingTree_GetProxyString(&br_target_addr, proxy_str,
 			                               sizeof(proxy_str), &total_ping_ms)
-			    && total_ping_ms > 0) {
-				float ping = (float)total_ping_ms;
+			    && proxy_str[0] != '\0') {
+				/* Sanity: if the ping tree returned the destination itself as the
+				   only "relay", discard it -- we must not proxy through the target. */
+				{
+					char target_str[64];
+					snprintf(target_str, sizeof(target_str), "%d.%d.%d.%d:%d",
+					         br_target_addr.ip[0], br_target_addr.ip[1],
+					         br_target_addr.ip[2], br_target_addr.ip[3],
+					         ntohs(br_target_addr.port));
+					if (strcmp(proxy_str, target_str) == 0) {
+						if ((int)cl_connectbr_verbose.value >= 1)
+							Com_Printf("  [ping tree] proxy_str eh o proprio servidor destino -- ignorado.\n");
+						goto skip_pingtree_route;
+					}
+				}
+				/* Accept even if total_ping_ms is 0 -- rely on proxy_str validity */
+				float ping = (total_ping_ms > 0) ? (float)total_ping_ms : 1.0f;
 				Com_Printf("  [ping tree best (%d hop%s)]... ping=%s%.0fms&r  loss=%s0%%&r\n",
 				           pathlen, pathlen > 1 ? "s" : "",
 				           CL_BR_PingColor(ping), ping,
@@ -429,8 +446,19 @@ void CL_Connect_BestRoute_f(void)
 				br_routes[br_route_count].via_proxy = true;
 				br_routes[br_route_count].valid     = true;
 				br_route_count++;
+			} else {
+				if ((int)cl_connectbr_verbose.value >= 1)
+					Com_Printf("  [ping tree] caminho encontrado (%d hop%s) mas proxy_str vazio -- ignorado.\n",
+					           pathlen, pathlen > 1 ? "s" : "");
 			}
+			skip_pingtree_route:;
+		} else {
+			if ((int)cl_connectbr_verbose.value >= 1)
+				Com_Printf("  [ping tree] nenhum caminho para %s -- multi-hop indisponivel.\n", addr);
 		}
+	} else if (!SB_PingTree_Built() || SB_PingTree_IsBuilding()) {
+		if ((int)cl_connectbr_verbose.value >= 1)
+			Com_Printf("  [ping tree] ainda nao construido -- sem multi-hop. Use 'sb_findroutes 1' e 'sb_buildpingtree' antes.\n");
 	}
 
 	// ── Step 2: individual proxies from browser + hardcoded fallback ──
@@ -441,6 +469,7 @@ void CL_Connect_BestRoute_f(void)
 	{
 		char proxy_ips  [CONNECTBR_MAX_PROXIES][64];
 		char proxy_names[CONNECTBR_MAX_PROXIES][128];
+		int  proxy_pings[CONNECTBR_MAX_PROXIES];   /* browser ping for pre-sort */
 		int  proxy_count = 0;
 
 		SB_ServerList_Lock();
@@ -451,9 +480,11 @@ void CL_Connect_BestRoute_f(void)
 			qbool dup = false;
 
 			if (!s) continue;
-			if (!s->qwfwd) continue;
+			if (ntohs(s->address.port) != 30000) continue;  /* only port 30000 = proxy */
 			if (s->ping < 0) continue;
-			if (memcmp(s->address.ip, br_target_addr.ip, 4) == 0) continue;
+			/* skip if this proxy IS the destination server (same IP and same port) */
+			if (memcmp(s->address.ip,   br_target_addr.ip,   4) == 0 &&
+			    s->address.port == br_target_addr.port) continue;
 
 			snprintf(proxy_ip, sizeof(proxy_ip), "%d.%d.%d.%d:%d",
 			         s->address.ip[0], s->address.ip[1],
@@ -470,9 +501,31 @@ void CL_Connect_BestRoute_f(void)
 			strlcpy(proxy_names[proxy_count],
 			        s->display.name[0] ? s->display.name : proxy_ip,
 			        sizeof(proxy_names[0]));
+			proxy_pings[proxy_count] = s->ping;  /* keep browser ping for sorting */
 			proxy_count++;
 		}
 		SB_ServerList_Unlock();
+
+		/* Sort proxy list by browser ping ascending (insertion sort on parallel arrays).
+		   This ensures that the lowest-ping proxies are measured and printed first. */
+		{
+			int ii, jj;
+			for (ii = 1; ii < proxy_count; ii++) {
+				char   tmp_ip  [64];
+				char   tmp_name[128];
+				int    tmp_ping = proxy_pings[ii];
+				strlcpy(tmp_ip,   proxy_ips  [ii], sizeof(tmp_ip));
+				strlcpy(tmp_name, proxy_names[ii], sizeof(tmp_name));
+				for (jj = ii - 1; jj >= 0 && proxy_pings[jj] > tmp_ping; jj--) {
+					proxy_pings[jj + 1] = proxy_pings[jj];
+					strlcpy(proxy_ips  [jj + 1], proxy_ips  [jj], sizeof(proxy_ips  [0]));
+					strlcpy(proxy_names[jj + 1], proxy_names[jj], sizeof(proxy_names[0]));
+				}
+				proxy_pings[jj + 1] = tmp_ping;
+				strlcpy(proxy_ips  [jj + 1], tmp_ip,   sizeof(proxy_ips  [0]));
+				strlcpy(proxy_names[jj + 1], tmp_name, sizeof(proxy_names[0]));
+			}
+		}
 
 		// Hardcoded fallback if browser empty
 		if (proxy_count == 0) {
@@ -482,7 +535,9 @@ void CL_Connect_BestRoute_f(void)
 				int j;
 				qbool dup = false;
 				if (!NET_StringToAdr(br_known_proxies[k], &kaddr)) continue;
-				if (memcmp(kaddr.ip, br_target_addr.ip, 4) == 0) continue;
+				/* skip if this hardcoded proxy IS the destination server */
+				if (memcmp(kaddr.ip,   br_target_addr.ip,   4) == 0 &&
+				    kaddr.port == br_target_addr.port) continue;
 				for (j = 0; j < br_route_count && !dup; j++)
 					if (strcmp(br_routes[j].proxylist, br_known_proxies[k]) == 0) dup = true;
 				for (j = 0; j < proxy_count && !dup; j++)
