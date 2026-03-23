@@ -2,7 +2,6 @@ name: main
 
 on:
   push:
-    # Only build branches on push, tags will be handled by 'release' job.
     branches:
       - '**'
   pull_request:
@@ -65,21 +64,17 @@ jobs:
       uses: actions/checkout@v4
       with:
         submodules: true
-        # To get correct revision which is needed by server to detect certain client bugs
         fetch-depth: 0
 
     - name: Fetch upstream tags for version metadata
       run: |
-          git remote add upstream https://github.com/QW-Group/ezquake-source.git
-          git fetch --tags --no-recurse-submodules upstream
+        git remote add upstream https://github.com/QW-Group/ezquake-source.git
+        git fetch --tags --no-recurse-submodules upstream
       if: github.repository != 'QW-Group/ezquake-source'
 
     - name: Set library build type to release
       shell: bash
       run: |
-        # Hopefully overrideable via environment in the future. Done here as
-        # vcpkg is chainloaded before cmake, and doesn't seem to apply args.
-        # Avoids building both -dbg and -rel versions of static libraries.
         for x in {cmake/triplets/*,vcpkg/triplets/{*,community/*}}; do
           if [[ -f $x ]]; then
             echo >> $x
@@ -93,8 +88,23 @@ jobs:
         cmakeVersion: "~3.28.0"
       if: matrix.os != 'ubuntu-latest'
 
+    # Cache the vcpkg binary cache directory.
+    # The x-gha backend was removed from vcpkg — using actions/cache directly
+    # avoids the warning and actually persists compiled packages between runs.
+    - name: Cache vcpkg binary cache
+      uses: actions/cache@v4
+      with:
+        path: ~/.cache/vcpkg/archives
+        key: vcpkg-${{ matrix.configurePreset }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
+        restore-keys: vcpkg-${{ matrix.configurePreset }}-
+      if: matrix.os != 'ubuntu-latest'
+
     - name: Setup vcpkg
       uses: lukka/run-vcpkg@v11
+      env:
+        # Disable the removed x-gha backend explicitly so vcpkg doesn't warn
+        # and doesn't attempt to use it as a fallback.
+        VCPKG_BINARY_SOURCES: "clear;files,~/.cache/vcpkg/archives,readwrite"
       if: matrix.os != 'ubuntu-latest'
 
     - name: Run CMake
@@ -105,9 +115,9 @@ jobs:
       env:
         CFLAGS: ${{ matrix.cflags }}
 
-
     - name: Make script executable
       run: chmod +x ./misc/appimage/appimage-manual_creation.sh
+
     - name: Generate Linux AppImage
       run: |
         export EXECUTABLE=$(echo build-${{ matrix.configurePreset }}/Release/unezquake*)
@@ -116,8 +126,7 @@ jobs:
       if: matrix.os == 'ubuntu-latest'
 
     - name: Preserve macOS executable bit
-      run: |
-        zip -r -9 unezQuake.zip unezQuake.app
+      run: zip -r -9 unezQuake.zip unezQuake.app
       working-directory: build-${{ matrix.configurePreset }}/Release
       if: matrix.os == 'macos-latest'
 
@@ -125,13 +134,11 @@ jobs:
       uses: actions/upload-artifact@v4
       with:
         name: ${{ matrix.name }}
-        path: |
-          build-${{ matrix.configurePreset }}/Release/${{ matrix.artifact }}
+        path: build-${{ matrix.configurePreset }}/Release/${{ matrix.artifact }}
         compression-level: 9
 
   macos-universal:
     needs: build
-
     name: "unezQuake-macOS-universal"
     runs-on: macos-latest
 
@@ -161,12 +168,29 @@ jobs:
         codesign --force --sign - --entitlements dist/macOS/unezquake.entitlements.plist --options runtime --timestamp unezQuake.app
         zip -r unezQuake-macOS-universal.zip unezQuake.app
 
+    # Replaces geekyeggo/delete-artifact@v5 which fails with JSON parse error
+    # on the current GitHub Actions API. Uses the official API via github-script.
     - name: Delete macOS arch specific builds
-      uses: geekyeggo/delete-artifact@v5
+      uses: actions/github-script@v7
       with:
-        name: |
-          unezQuake-macOS-arm64
-          unezQuake-macOS-x64
+        script: |
+          const names = ['unezQuake-macOS-arm64', 'unezQuake-macOS-x64'];
+          const { data: { artifacts } } = await github.rest.actions.listWorkflowRunArtifacts({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            run_id: context.runId,
+          });
+          for (const name of names) {
+            const artifact = artifacts.find(a => a.name === name);
+            if (artifact) {
+              await github.rest.actions.deleteArtifact({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                artifact_id: artifact.id,
+              });
+              console.log(`Deleted: ${name}`);
+            }
+          }
 
     - name: Upload Build Artifact
       uses: actions/upload-artifact@v4
@@ -190,7 +214,6 @@ jobs:
         with:
           path: unezquake
           submodules: true
-          # To get correct revision when generating version.json for source release tarball
           fetch-depth: 0
         if: github.event_name == 'release'
 
@@ -209,13 +232,9 @@ jobs:
           dist_dir="${GITHUB_WORKSPACE}/dist"
           mkdir "${dist_dir}"
 
-          # Reset timestamp to time of commit before compression
           find "artifacts" -type f -exec touch --date="${RELEASE_DATE}" {} +
-
-          # Set executable bit for all files
           find "artifacts" -type f -exec chmod 755 {} +
 
-          # Recompress before attaching to release, avoiding double-zip of macOS
           (
             cd artifacts
             for target in *; do
@@ -227,7 +246,6 @@ jobs:
             done;
           )
 
-          # Generate source release with submodule, version.json etc
           (
             cd "${GITHUB_WORKSPACE}/unezquake"
             dist/gen-release.sh
@@ -237,7 +255,6 @@ jobs:
           find "${dist_dir}" -type f -execdir sha256sum {} \; > "checksums.txt"
           mv "checksums.txt" "${dist_dir}/"
 
-          # Reset timestamp to time of commit for all release artifacts
           find "${dist_dir}" -type f -exec touch --date="${RELEASE_DATE}" {} +
 
           echo "Release artifacts:"
@@ -257,7 +274,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         if: github.event_name == 'release'
 
-      - name: Prepare Upload Environemnt
+      - name: Prepare Upload Environment
         run: |
           sudo apt-get -qq update
           sudo apt-get -qq --no-install-recommends install openssh-client
@@ -271,14 +288,6 @@ jobs:
 
       - name: Prepare upload to builds.quakeworld.nu
         run: |
-          # Build file structure for uploading
-          # snapshots:
-          #  upload/snapshots/latest/$os/$arch/$filename
-          #  upload/snapshots/$os/$arch/$prefix_$filename
-          # releases:
-          #  upload/releases/latest/$os/$arch/$filename
-          #  upload/releases/$tag/$os/$arch/$filename
-
           set -e
 
           upload_dir="${GITHUB_WORKSPACE}/upload"
@@ -295,30 +304,23 @@ jobs:
             upload_prefix="snapshots"
           fi
 
-          # Collect upload structure
           for artifact in artifacts/*/*; do
             artifact_file=$(basename "${artifact}")
             artifact_dir=$(dirname "${artifact}")
-
             IFS='-' read -r ezq os arch <<< "${artifact_dir}"
-
             mkdir -p "${main_dir}/${os}/${arch}" "${latest_dir}/${os}/${arch}"
-
             cp "${artifact}" "${main_dir}/${os}/${arch}/${prefix}${artifact_file}"
             cp "${artifact}" "${latest_dir}/${os}/${arch}/${artifact_file}"
           done
 
-          # Set executable bit for all files
           find "${upload_dir}" -type f -exec chmod 755 {} +
 
-          # Generate checksums
           for artifact in $(find "${upload_dir}" -type f); do
             artifact_file=$(basename "${artifact}")
             artifact_dir=$(dirname "${artifact}")
             (cd "${artifact_dir}" && md5sum "${artifact_file}" > "${artifact_file}.md5")
           done
 
-          # Reset timestamp to time of commit
           find "${upload_dir}" -type f -exec touch --date="${RELEASE_DATE}" {} +
 
           echo "Upload artifacts:"
