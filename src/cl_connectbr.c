@@ -258,7 +258,10 @@ static int CL_BR_BuildCandidates(const netadr_t *addr,
 		strlcpy(candidates[count].proxylist,
 		        cl_proxyaddr.string,
 		        sizeof(candidates[count].proxylist));
-		Cvar_Set(&cl_proxyaddr, saved_proxy); // restore immediately
+		// Restore immediately — ping tree must not leave its value in
+		// cl_proxyaddr, as subsequent connect commands would pick it up
+		// and misroute the connection.
+		Cvar_Set(&cl_proxyaddr, saved_proxy);
 		snprintf(candidates[count].label, sizeof(candidates[count].label),
 		         "ping tree best (%d hop%s)", pathlen, pathlen > 1 ? "s" : "");
 		candidates[count].ping_ms   = 0; // measured below
@@ -327,8 +330,12 @@ static void CL_BR_ApplyRoute(int idx)
 	route_candidate_t *r = &br_routes[idx];
 	const char *pc = CL_BR_PingColor(r->ping_ms);
 
-	// Set proxy from the stored string (empty = direct, no proxy)
-	Cvar_Set(&cl_proxyaddr, r->proxylist);
+	// Always clear cl_proxyaddr first to avoid stale proxy from a
+	// previous connectbr session routing this connection incorrectly.
+	// Then set it only if this route actually uses a proxy.
+	Cvar_Set(&cl_proxyaddr, "");
+	if (r->proxylist[0])
+		Cvar_Set(&cl_proxyaddr, r->proxylist);
 
 	Com_Printf("\n&cf80connectbr:&r route #%d — %s\n", idx + 1, r->label);
 	Com_Printf("  ping: %s%.0fms&r  jitter: %s%.0fms&r  loss: %s%.0f%%&r\n",
@@ -394,6 +401,12 @@ void CL_Connect_BestRoute_f(void)
 	Com_Printf("\n&cf80connectbr:&r testing %d route(s) to %s...\n\n",
 	           candidate_count, Cmd_Argv(1));
 
+	// Clear any stale cl_proxyaddr left by a previous session or ping tree call
+	{
+		extern cvar_t cl_proxyaddr;
+		Cvar_Set(&cl_proxyaddr, "");
+	}
+
 	br_route_count   = 0;
 	br_current_route = 0;
 	br_active        = false;
@@ -407,11 +420,24 @@ void CL_Connect_BestRoute_f(void)
 		Com_Printf("  [%d/%d] %s... ", i + 1, candidate_count, candidates[i].label);
 
 		if (candidates[i].proxylist[0]) {
-			// Proxy: measure RTT to the first (closest) hop via A2A_PING.
-			// Proxies respond to this reliably without priority distortion.
+			// Proxy route: measure RTT to the first (closest) hop.
+			// Try browser ping first — if the proxy appears in the server
+			// list (it will, since we enumerate from serversn), use that
+			// value to avoid A2A_PING distortion on qwfwd proxies too.
 			CL_BR_GetFirstHop(candidates[i].proxylist, first_hop, sizeof(first_hop));
 			NET_StringToAdr(first_hop, &hop_addr);
-			ok = CL_BR_MeasureHop(&hop_addr, &hop_ping, &jitter, &loss);
+			{
+				int browser_ping = CL_BR_GetBrowserPing(&hop_addr);
+				if (browser_ping >= 0) {
+					hop_ping = (float)browser_ping;
+					jitter   = 0;
+					loss     = 0;
+					ok       = true;
+				} else {
+					// Not in browser — fall back to A2A_PING
+					ok = CL_BR_MeasureHop(&hop_addr, &hop_ping, &jitter, &loss);
+				}
+			}
 		} else {
 			// Direct: reuse server browser ping to avoid A2A_PING distortion.
 			// (A2A_PING on game servers can read 10x higher than actual in-game ping.)
