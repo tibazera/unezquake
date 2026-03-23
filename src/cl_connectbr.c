@@ -229,15 +229,20 @@ static qbool CL_BR_MeasureHop(const netadr_t *dest,
 
 	NetadrToSockadr(dest, &to_addr);
 
-	for (i = 0; i < test_packets; i++) {
-		send_times[i] = Sys_DoubleTime();
-		sendto(sock, packet, strlen(packet), 0,
-		       (struct sockaddr *)&to_addr, sizeof(struct sockaddr));
-		Sys_MSleep((int)cl_connectbr_packet_delay.value);
+	{
+		int pkt_delay = (int)cl_connectbr_packet_delay.value;
+		if (pkt_delay < 5) pkt_delay = 5;  // minimum 5ms between probes
+		for (i = 0; i < test_packets; i++) {
+			send_times[i] = Sys_DoubleTime();
+			sendto(sock, packet, strlen(packet), 0,
+			       (struct sockaddr *)&to_addr, sizeof(struct sockaddr));
+			Sys_MSleep(pkt_delay);
+		}
 	}
 
 	{
 		int timeout_ms = (int)cl_connectbr_timeout_ms.value;
+		if (timeout_ms <= 0) timeout_ms = 600;  // fallback 600ms
 		double deadline = Sys_DoubleTime() + (timeout_ms / 1000.0);
 
 		while (Sys_DoubleTime() < deadline) {
@@ -420,6 +425,17 @@ static void CL_BR_ApplyRoute(int idx)
 }
 
 // ─────────────────────────────────────────────
+// Known QW proxy fallback list (used when server browser is empty)
+// ─────────────────────────────────────────────
+static const char *br_known_proxies[] = {
+	"177.93.132.220:30000",   // ! Pent @ Ilha QWFWD
+	"103.63.29.40:30000",     // ! Qlash Lisbon | Antilag QWFWD
+	"arenacamper.ddns.net:30000",
+	"berlin.qwsv.net:30000",
+	NULL
+};
+
+// ─────────────────────────────────────────────
 // PUBLIC: connectbr <address>
 // ─────────────────────────────────────────────
 void CL_Connect_BestRoute_f(void)
@@ -438,7 +454,6 @@ void CL_Connect_BestRoute_f(void)
 		Com_Printf("Usage: connectbr <address>\n");
 		Com_Printf("Tests all proxy routes (ping + loss) and connects via the best one.\n");
 		Com_Printf("Use 'connectnext' to try the next route if needed.\n");
-		Com_Printf("Requires: sb_findroutes 1 + server browser refreshed.\n");
 		return;
 	}
 
@@ -459,42 +474,37 @@ void CL_Connect_BestRoute_f(void)
 	if (br_target_addr.port == 0)
 		br_target_addr.port = htons(27500);
 
+	// If ping tree is still building, wait briefly rather than failing
 	if (SB_PingTree_IsBuilding()) {
 		Com_Printf("connectbr: ping tree still building -- please wait and retry.\n");
 		return;
 	}
 
-	if (!SB_PingTree_Built()) {
-		Com_Printf("connectbr: no route data.\n");
-		Com_Printf("  Enable 'sb_findroutes 1', refresh the browser, then retry.\n");
-		Com_Printf("  Falling back to direct connection...\n");
-		Cvar_Set(&cl_proxyaddr, "");
-		Cbuf_AddText(va("connect %s\n", addr));
-		return;
-	}
-
-	br_measuring = true;
+	br_measuring     = true;
 	Cvar_Set(&cl_proxyaddr, "");
 	br_route_count   = 0;
 	br_current_route = 0;
 	br_active        = false;
 
+	// Clear proxy cache so stale data from a previous connectbr call is not reused
+	proxy_cache_count = 0;
+
 	if ((int)cl_connectbr_verbose.value >= 1) {
 		Com_Printf("\n&cf80connectbr:&r testing routes to %s...\n", addr);
 		if ((int)cl_connectbr_verbose.value >= 2) {
-			Com_Printf("  packets=%d  timeout=%dms  delay=%dms\n",
-			           (int)cl_connectbr_test_packets.value,
-			           (int)cl_connectbr_timeout_ms.value,
-			           (int)cl_connectbr_packet_delay.value);
+			int pkts  = (int)cl_connectbr_test_packets.value > 0 ? (int)cl_connectbr_test_packets.value : 25;
+			int toms  = (int)cl_connectbr_timeout_ms.value   > 0 ? (int)cl_connectbr_timeout_ms.value   : 600;
+			int delay = (int)cl_connectbr_packet_delay.value > 0 ? (int)cl_connectbr_packet_delay.value : 15;
+			Com_Printf("  packets=%d  timeout=%dms  delay=%dms\n", pkts, toms, delay);
 			Com_Printf("  score weights: ping=%.2f loss=%.2f\n",
-			           cl_connectbr_weight_ping.value,
-			           cl_connectbr_weight_loss.value);
+			           cl_connectbr_weight_ping.value  > 0 ? cl_connectbr_weight_ping.value  : 0.6f,
+			           cl_connectbr_weight_loss.value  > 0 ? cl_connectbr_weight_loss.value  : 0.4f);
 		}
 		Com_Printf("\n");
 	}
 
-	// ── Ping tree best proxy path ─────────────────────────────────────
-	{
+	// ── Ping tree best proxy path (only if ping tree was built) ───────
+	if (SB_PingTree_Built() && br_route_count < CONNECTBR_MAX_ROUTES - 1) {
 		int pathlen = SB_PingTree_GetPathLen(&br_target_addr);
 		if (pathlen > 0) {
 			int  dummy = 0;
@@ -545,8 +555,9 @@ void CL_Connect_BestRoute_f(void)
 			int j;
 			qbool dup = false;
 
+			if (!s) continue;                // NULL guard
 			if (!s->qwfwd) continue;
-			if (s->ping  < 0) continue;
+			if (s->ping < 0) continue;
 
 			// Skip proxy if same IP as target server
 			if (memcmp(s->address.ip, br_target_addr.ip, 4) == 0)
@@ -567,8 +578,7 @@ void CL_Connect_BestRoute_f(void)
 
 			if (dup) continue;
 
-			strlcpy(proxy_ips  [proxy_count], proxy_ip,
-			        sizeof(proxy_ips[0]));
+			strlcpy(proxy_ips  [proxy_count], proxy_ip,   sizeof(proxy_ips[0]));
 			strlcpy(proxy_names[proxy_count],
 			        s->display.name[0] ? s->display.name : proxy_ip,
 			        sizeof(proxy_names[0]));
@@ -576,8 +586,36 @@ void CL_Connect_BestRoute_f(void)
 		}
 		SB_ServerList_Unlock();
 
+		// If browser returned no proxies, fall back to hardcoded known proxies
+		if (proxy_count == 0) {
+			int k;
+			for (k = 0; br_known_proxies[k] && proxy_count < CONNECTBR_MAX_PROXIES; k++) {
+				netadr_t kaddr;
+				int j;
+				qbool dup = false;
+
+				if (!NET_StringToAdr(br_known_proxies[k], &kaddr)) continue;
+
+				// Skip if same IP as target
+				if (memcmp(kaddr.ip, br_target_addr.ip, 4) == 0) continue;
+
+				// Skip duplicates already in br_routes
+				for (j = 0; j < br_route_count && !dup; j++)
+					if (strcmp(br_routes[j].proxylist, br_known_proxies[k]) == 0) dup = true;
+				for (j = 0; j < proxy_count && !dup; j++)
+					if (strcmp(proxy_ips[j], br_known_proxies[k]) == 0) dup = true;
+
+				if (dup) continue;
+
+				strlcpy(proxy_ips  [proxy_count], br_known_proxies[k], sizeof(proxy_ips[0]));
+				strlcpy(proxy_names[proxy_count], br_known_proxies[k], sizeof(proxy_names[0]));
+				proxy_count++;
+			}
+		}
+
 		// Measure each collected proxy
-		for (i = 0; i < proxy_count && br_route_count < CONNECTBR_MAX_ROUTES; i++) {
+		// Reserve 1 slot for direct connection, hence CONNECTBR_MAX_ROUTES - 1
+		for (i = 0; i < proxy_count && br_route_count < CONNECTBR_MAX_ROUTES - 1; i++) {
 			float ping, loss;
 			Com_Printf("  [%s]... ", proxy_names[i]);
 
@@ -603,7 +641,7 @@ void CL_Connect_BestRoute_f(void)
 	}
 
 	// ── Direct connection ─────────────────────────────────────────────
-	{
+	if (br_route_count < CONNECTBR_MAX_ROUTES) {
 		float ping, loss;
 		Com_Printf("  [direct]... ");
 		if (CL_BR_MeasureCandidate("", false, &ping, &loss)) {
@@ -638,7 +676,7 @@ void CL_Connect_BestRoute_f(void)
 	{
 		int max_ping = (int)cl_connectbr_ping_orange.value;
 		int usable   = 0;
-		if (max_ping <= 0) max_ping = 130;  // safety: never filter everything if cvar is 0
+		if (max_ping <= 0) max_ping = 130;
 		for (i = 0; i < br_route_count; i++) {
 			if (br_routes[i].ping_ms <= max_ping) {
 				if (i != usable)
