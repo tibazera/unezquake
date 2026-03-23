@@ -12,7 +12,7 @@ via the best one. No speculative total estimates — only real measurements.
 #include "EX_browser.h"
 #include "cl_connectbr.h"
 
-#define CONNECTBR_MAX_ROUTES     6
+#define CONNECTBR_MAX_ROUTES     12
 #define CONNECTBR_TEST_PACKETS   20
 #define CONNECTBR_TIMEOUT_MS     600
 #define CONNECTBR_PACKET_DELAY   15
@@ -262,56 +262,84 @@ static int CL_BR_BuildAndMeasure(void)
 	}
 
 	// ── Individual proxies from server browser ──────────────────────────
-	SB_ServerList_Lock();
-	for (i = 0; i < serversn && count < CONNECTBR_MAX_ROUTES - 1; i++) {
-		server_data *s = servers[i];
-		char proxy_ip[64];
-		float ping, loss;
-		int j;
-		qbool dup = false;
-
-		if (!s->qwfwd) continue;
-		if (s->ping < 0) continue;
-
-		snprintf(proxy_ip, sizeof(proxy_ip), "%d.%d.%d.%d:%d",
-		         s->address.ip[0], s->address.ip[1],
-		         s->address.ip[2], s->address.ip[3],
-		         ntohs(s->address.port));
-
-		for (j = 0; j < count; j++) {
-			if (strcmp(br_routes[j].proxylist, proxy_ip) == 0) {
-				dup = true; break;
-			}
-		}
-		if (dup) continue;
-
-		Com_Printf("  [%s]... ",
-		           s->display.name[0] ? s->display.name : proxy_ip);
-		SB_ServerList_Unlock();
-
-		if (CL_BR_MeasureCandidate(proxy_ip, true, &ping, &loss)) {
-			Com_Printf("ping=%s%.0fms&r  loss=%s%.0f%%&r\n",
-			           CL_BR_PingColor(ping), ping,
-			           CL_BR_LossColor(loss), loss);
-
-			strlcpy(br_routes[count].proxylist, proxy_ip,
-			        sizeof(br_routes[count].proxylist));
-			snprintf(br_routes[count].label, sizeof(br_routes[count].label),
-			         "via proxy %s",
-			         s->display.name[0] ? s->display.name : proxy_ip);
-			br_routes[count].ping_ms   = ping;
-			br_routes[count].loss_pct  = loss;
-			br_routes[count].score     = CL_BR_Score(ping, loss, true);
-			br_routes[count].via_proxy = true;
-			br_routes[count].valid     = true;
-			count++;
-		} else {
-			Com_Printf("&cf00unreachable&r\n");
-		}
+	// We collect ALL qwfwd proxies first (ignoring sb_showproxies filter),
+	// then measure them. We skip proxies whose IP matches the target server
+	// (no point routing through the server's own proxy to reach itself).
+	{
+		// Collect proxy candidates into a temp list first (unlock-safe)
+		char proxy_ips[32][64];
+		char proxy_names[32][128];
+		int  proxy_count = 0;
+		int  j;
 
 		SB_ServerList_Lock();
+		for (i = 0; i < serversn && proxy_count < 32; i++) {
+			server_data *s = servers[i];
+			char proxy_ip[64];
+			qbool dup = false;
+
+			if (!s->qwfwd) continue;
+			if (s->ping < 0) continue;
+
+			snprintf(proxy_ip, sizeof(proxy_ip), "%d.%d.%d.%d:%d",
+			         s->address.ip[0], s->address.ip[1],
+			         s->address.ip[2], s->address.ip[3],
+			         ntohs(s->address.port));
+
+			// Skip if proxy IP matches target server IP (same machine)
+			if (memcmp(s->address.ip, br_target_addr.ip, 4) == 0)
+				continue;
+
+			// Skip duplicates already in br_routes (ping tree)
+			for (j = 0; j < count; j++) {
+				if (strcmp(br_routes[j].proxylist, proxy_ip) == 0) {
+					dup = true; break;
+				}
+			}
+			if (dup) continue;
+
+			// Skip duplicates within our temp list
+			for (j = 0; j < proxy_count; j++) {
+				if (strcmp(proxy_ips[j], proxy_ip) == 0) {
+					dup = true; break;
+				}
+			}
+			if (dup) continue;
+
+			strlcpy(proxy_ips[proxy_count], proxy_ip, sizeof(proxy_ips[0]));
+			strlcpy(proxy_names[proxy_count],
+			        s->display.name[0] ? s->display.name : proxy_ip,
+			        sizeof(proxy_names[0]));
+			proxy_count++;
+		}
+		SB_ServerList_Unlock();
+
+		// Now measure each proxy (no lock held during network I/O)
+		for (i = 0; i < proxy_count && count < CONNECTBR_MAX_ROUTES - 1; i++) {
+			float ping, loss;
+
+			Com_Printf("  [%s]... ", proxy_names[i]);
+
+			if (CL_BR_MeasureCandidate(proxy_ips[i], true, &ping, &loss)) {
+				Com_Printf("ping=%s%.0fms&r  loss=%s%.0f%%&r\n",
+				           CL_BR_PingColor(ping), ping,
+				           CL_BR_LossColor(loss), loss);
+
+				strlcpy(br_routes[count].proxylist, proxy_ips[i],
+				        sizeof(br_routes[count].proxylist));
+				snprintf(br_routes[count].label, sizeof(br_routes[count].label),
+				         "via proxy %s", proxy_names[i]);
+				br_routes[count].ping_ms   = ping;
+				br_routes[count].loss_pct  = loss;
+				br_routes[count].score     = CL_BR_Score(ping, loss, true);
+				br_routes[count].via_proxy = true;
+				br_routes[count].valid     = true;
+				count++;
+			} else {
+				Com_Printf("&cf00unreachable&r\n");
+			}
+		}
 	}
-	SB_ServerList_Unlock();
 
 	// ── Direct connection ───────────────────────────────────────────────
 	{
