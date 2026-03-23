@@ -10,10 +10,7 @@ cl_connectbr.h - Smart route selection for connectbr/connectnext commands
 // cl_main.c already includes quakedef.h before cl_connectbr.h so this is fine.
 // If included standalone, add: #include "quakedef.h"
 
-// CVars (extern declarations for use in other modules)
-extern cvar_t cl_connectbr_ping_green;
-extern cvar_t cl_connectbr_ping_yellow;
-extern cvar_t cl_connectbr_ping_orange;
+// CVars (defined in cl_connectbr.c — include quakedef.h before this header if needed)
 
 // Public functions
 void CL_ConnectBR_Init(void);          // register cvars — call from CL_InitLocal
